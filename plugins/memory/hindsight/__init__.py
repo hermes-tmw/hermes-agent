@@ -36,6 +36,7 @@ import logging
 import os
 import queue
 import threading
+import time
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -1625,69 +1626,13 @@ class HindsightMemoryProvider(MemoryProvider):
         if not new_id:
             return
 
-        # 1. Flush any buffered turns under the OLD identifiers. Snapshot
-        # everything before mutating self._* so metadata + tags + doc_id
-        # all reference the old session consistently.
-        if self._session_turns:
-            old_turns = list(self._session_turns)
-            old_session_id = self._session_id
-            old_parent_session_id = self._parent_session_id
-            old_turn_index = self._turn_index
-            old_metadata = self._build_metadata(
-                message_count=len(old_turns) * 2,
-                turn_index=old_turn_index,
-            )
-            old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
-            old_content = "[" + ",".join(old_turns) + "]"
-            # Resolve doc_id + update_mode against the OLD session BEFORE
-            # we rotate _session_id, so the flush lands in the old
-            # session's document either way (legacy: per-process unique;
-            # ≥0.5.0: stable session-scoped + append).
-            old_document_id, old_update_mode = self._resolve_retain_target(
-                self._document_id
-            )
-
-            def _flush():
-                try:
-                    item = self._build_retain_kwargs(
-                        old_content,
-                        context=self._retain_context,
-                        metadata=old_metadata,
-                        tags=old_lineage_tags or None,
-                    )
-                    item.pop("bank_id", None)
-                    item.pop("retain_async", None)
-                    if old_update_mode is not None:
-                        item["update_mode"] = old_update_mode
-                    logger.debug(
-                        "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
-                    )
-                    self._run_hindsight_operation(
-                        lambda client: client.aretain_batch(
-                            bank_id=self._bank_id,
-                            items=[item],
-                            document_id=old_document_id,
-                            retain_async=self._retain_async,
-                        )
-                    )
-                except Exception as e:
-                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
-
-            # Route the flush through the same writer queue sync_turn
-            # uses. That serializes it behind any still-queued retains
-            # from the old session (FIFO by document_id), avoids racing
-            # two threads on aretain_batch against the same document, and
-            # keeps shutdown's drain semantics intact. Skip enqueue if
-            # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
-                self._ensure_writer()
-                self._register_atexit()
-                self._retain_queue.put(_flush)
+        # 1. Flush any buffered turns under the OLD identifiers before
+        # rotating session_id. The shared helper snapshots the per-
+        # session state before constructing its closure, so the flush
+        # lands in the old session's document even though the next
+        # statements clear / rotate self._session_id / _document_id.
+        # See :meth:`_flush_buffered_turns` for the snapshot logic.
+        self._flush_buffered_turns()
 
         # 2. Drain any in-flight prefetch from the old session and drop
         # its cached result so the new session doesn't see stale recall.
@@ -1708,6 +1653,141 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,
+        )
+
+    def _flush_buffered_turns(self) -> None:
+        """Flush any turns currently in ``_session_turns`` as a single
+        retain. No-op when the buffer is empty or when shutdown has fired.
+
+        Snapshots ``_session_id`` / ``_parent_session_id`` /
+        ``_turn_index`` / ``_document_id`` before constructing the
+        closure so the flush lands under the *current* identifiers even
+        if the caller is about to rotate to a new session.
+
+        Used by both :meth:`on_session_switch` (before rotating to a new
+        session id) and :meth:`on_session_end` (at /exit and gateway
+        session-expiry). Routes through the same writer queue ``sync_turn``
+        uses so flushes serialise FIFO behind any still-queued retains
+        from the same document.
+        """
+        if not self._session_turns:
+            return
+        old_turns = list(self._session_turns)
+        old_session_id = self._session_id
+        old_parent_session_id = self._parent_session_id
+        old_turn_index = self._turn_index
+        old_metadata = self._build_metadata(
+            message_count=len(old_turns) * 2,
+            turn_index=old_turn_index,
+        )
+        old_lineage_tags: list[str] = []
+        if old_session_id:
+            old_lineage_tags.append(f"session:{old_session_id}")
+        if old_parent_session_id:
+            old_lineage_tags.append(f"parent:{old_parent_session_id}")
+        old_content = "[" + ",".join(old_turns) + "]"
+        old_document_id, old_update_mode = self._resolve_retain_target(
+            self._document_id
+        )
+
+        def _flush():
+            try:
+                item = self._build_retain_kwargs(
+                    old_content,
+                    context=self._retain_context,
+                    metadata=old_metadata,
+                    tags=old_lineage_tags or None,
+                )
+                item.pop("bank_id", None)
+                item.pop("retain_async", None)
+                if old_update_mode is not None:
+                    item["update_mode"] = old_update_mode
+                logger.debug(
+                    "Hindsight flush-buffered-turns: bank=%s, doc=%s, mode=%s, num_turns=%d",
+                    self._bank_id, old_document_id, old_update_mode, len(old_turns),
+                )
+                self._run_hindsight_operation(
+                    lambda client: client.aretain_batch(
+                        bank_id=self._bank_id,
+                        items=[item],
+                        document_id=old_document_id,
+                        retain_async=self._retain_async,
+                    )
+                )
+            except Exception as e:
+                logger.warning(
+                    "Hindsight flush-buffered-turns failed: %s", e, exc_info=True
+                )
+
+        if not self._shutting_down.is_set():
+            self._ensure_writer()
+            self._register_atexit()
+            self._retain_queue.put(_flush)
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Flush buffered turns at the real session boundary.
+
+        Hermes calls this at ``/exit`` from the CLI and at gateway
+        session-expiry — the lifecycle events where there is no "next
+        session" for :meth:`on_session_switch` to flush against.
+        Without this hook, any ``retain_every_n_turns > 1`` users
+        silently lose whatever's in ``_session_turns`` since the last
+        threshold-crossing when the user types ``/exit``. The base
+        class default for :meth:`MemoryProvider.on_session_end` is a
+        no-op, so an unimplemented override is the data-loss path.
+
+        ``messages`` is part of the ABC signature but unused here —
+        the in-memory ``_session_turns`` buffer is the authoritative
+        source for what hasn't yet been retained.
+
+        Unlike :meth:`on_session_switch`, we **block until the writer
+        has drained the flush we enqueued** (up to a 30-second ceiling).
+        At /exit time the interpreter starts tearing down concurrent
+        futures very shortly after returning from this hook — the
+        bounded :meth:`shutdown` join that runs after us is too late
+        once Python has begun closing the asyncio loop, manifesting as
+        ``cannot schedule new futures after interpreter shutdown`` in
+        the writer's exception handler.  Joining here guarantees the
+        flush completes (or fails for a real reason) before any of
+        that teardown begins.
+        """
+        had_buffer = bool(self._session_turns)
+        self._flush_buffered_turns()
+        if not had_buffer:
+            return
+        # Block until the queue drains.  Cap matches shutdown()'s
+        # writer.join() timeout so this hook never wedges the CLI.
+        try:
+            self._wait_retain_queue_drained(timeout=30.0)
+        except Exception as exc:
+            logger.warning(
+                "Hindsight on_session_end: drain wait failed (%s); "
+                "shutdown() will still bound the writer",
+                exc,
+            )
+
+    def _wait_retain_queue_drained(self, *, timeout: float) -> None:
+        """Best-effort wait for the retain queue to empty.
+
+        ``queue.Queue.join`` requires ``task_done`` calls that the
+        writer makes after each item; we re-implement the wait with a
+        deadline so callers never block indefinitely on a stuck writer.
+        """
+        if self._retain_queue is None:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # qsize is approximate but good enough as a drain signal —
+            # the writer pulls one item at a time and is the only
+            # consumer, so reaching 0 means the in-flight item is
+            # either done or about to be.
+            if self._retain_queue.unfinished_tasks == 0:
+                return
+            time.sleep(0.05)
+        logger.warning(
+            "Hindsight on_session_end: writer did not drain within %.1fs "
+            "(%d task(s) still queued); shutdown() will attempt another join",
+            timeout, self._retain_queue.unfinished_tasks,
         )
 
     def shutdown(self) -> None:

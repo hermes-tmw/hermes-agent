@@ -1094,6 +1094,99 @@ class TestSessionSwitchBufferFlush:
 
 
 # ---------------------------------------------------------------------------
+# on_session_end — /exit, gateway expiry: must flush buffered turns too
+# ---------------------------------------------------------------------------
+
+
+class TestSessionEndBufferFlush:
+    """on_session_end is the terminal lifecycle hook (fired by CLI /exit
+    and gateway session expiry); without an override the base-class no-op
+    silently drops everything in _session_turns when retain_every_n_turns
+    > 1.  These tests pin the override and the shared _flush_buffered_turns
+    helper that both on_session_end and on_session_switch route through.
+    """
+
+    def test_session_end_flushes_buffered_turns(self, provider_with_config):
+        """/exit with retain_every_n_turns > 1 must NOT silently lose
+        whatever's in the buffer.  Same shape as the session-switch test
+        but called through on_session_end (no rotation afterwards)."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        old_doc = p._document_id
+        old_session_id = p._session_id
+
+        # Two turns buffered, no retain yet (boundary is at turn 3).
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._client.aretain_batch.assert_not_called()
+
+        # /exit equivalent.  messages arg is part of the ABC signature
+        # but unused by the implementation — the in-memory buffer is the
+        # source of truth.
+        p.on_session_end([])
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        kw = p._client.aretain_batch.call_args.kwargs
+        assert kw["document_id"] == old_doc
+        item = kw["items"][0]
+        content = json.loads(item["content"])
+        flat = json.dumps(content)
+        assert "turn1-user" in flat
+        assert "turn2-user" in flat
+        # Lineage tags reflect the (still-current) session.
+        assert f"session:{old_session_id}" in item["tags"]
+
+    def test_session_end_no_flush_when_buffer_empty(self, provider):
+        """on_session_end with nothing buffered must not fire a spurious
+        retain — clean exit on a session that just retained should be
+        silent."""
+        provider.on_session_end([])
+        provider._retain_queue.join()
+        provider._client.aretain_batch.assert_not_called()
+
+    def test_session_end_no_flush_when_shutting_down(self, provider_with_config):
+        """If shutdown has already fired (interpreter teardown ordering),
+        the helper must NOT enqueue — the writer is draining/gone and a
+        late put could either race shutdown's join() or be silently
+        dropped after the sentinel.  Either way, on_session_end is a
+        no-op in this state."""
+        p = provider_with_config(retain_every_n_turns=5, retain_async=False)
+        p.sync_turn("buffered-user", "buffered-asst")
+
+        # Simulate shutdown having fired before on_session_end.
+        p._shutting_down.set()
+
+        p.on_session_end([])
+
+        # Queue may not even exist; the guard is the early return.
+        if p._retain_queue is not None:
+            assert p._retain_queue.qsize() == 0
+        p._client.aretain_batch.assert_not_called()
+
+    def test_session_end_unchanged_session_state(self, provider_with_config):
+        """Unlike on_session_switch, on_session_end must NOT clear
+        _session_turns / _document_id / _turn_counter.  The process is
+        terminating — there's no "next session" to set up — and other
+        teardown paths (shutdown, atexit) may still want to inspect
+        the buffer for diagnostics."""
+        p = provider_with_config(retain_every_n_turns=10, retain_async=False)
+        p.sync_turn("u", "a")
+        original_doc = p._document_id
+        original_session = p._session_id
+        original_turn_counter = p._turn_counter
+
+        p.on_session_end([])
+        p._retain_queue.join()
+
+        # State preserved — caller (cli.py) calls shutdown() next, which
+        # owns the actual teardown sequence.
+        assert p._document_id == original_doc
+        assert p._session_id == original_session
+        assert p._turn_counter == original_turn_counter
+        assert p._session_turns  # still contains the buffered turn(s)
+
+
+# ---------------------------------------------------------------------------
 # update_mode='append' capability probe + retain dispatch
 # ---------------------------------------------------------------------------
 
