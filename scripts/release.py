@@ -1576,6 +1576,7 @@ AUTHOR_MAP = {
     "infinitycrew39@gmail.com": "infinitycrew39",  # PR #47945 salvage (scope langfuse trace state by turn/request ids; #48292)
     "claw@localhost": "claw",  # local dev user
     "hermes-tmw@github.com": "hermes-tmw",  # Hermes AI agent account
+    "mail@tomwhipple.com": "tomwhipple",  # Tom Whipple (repo owner)
 }
 
 
