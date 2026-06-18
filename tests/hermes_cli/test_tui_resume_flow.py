@@ -630,9 +630,10 @@ def _stub_plugin_discovery(monkeypatch):
 
 def test_oneshot_rejects_invalid_only_toolsets(monkeypatch, capsys):
     _stub_plugin_discovery(monkeypatch)
-    from hermes_cli.oneshot import run_oneshot
+    import hermes_cli.oneshot as oneshot_mod
 
-    assert run_oneshot("hello", toolsets="nope") == 2
+    monkeypatch.setattr(oneshot_mod, "_hard_exit", lambda code: code)
+    assert oneshot_mod.run_oneshot("hello", toolsets="nope") == 2
     err = capsys.readouterr().err
     assert "nope" in err
     assert "did not contain any valid toolsets" in err
@@ -643,6 +644,7 @@ def test_oneshot_fails_closed_on_empty_final_response(monkeypatch, capsys):
     import hermes_cli.oneshot as oneshot_mod
 
     monkeypatch.setattr(oneshot_mod, "_run_agent", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(oneshot_mod, "_hard_exit", lambda code: code)
 
     assert oneshot_mod.run_oneshot("hello") == 1
     captured = capsys.readouterr()
@@ -655,6 +657,7 @@ def test_oneshot_prints_nonempty_final_response(monkeypatch, capsys):
     import hermes_cli.oneshot as oneshot_mod
 
     monkeypatch.setattr(oneshot_mod, "_run_agent", lambda *_args, **_kwargs: "done")
+    monkeypatch.setattr(oneshot_mod, "_hard_exit", lambda code: code)
 
     assert oneshot_mod.run_oneshot("hello") == 0
     captured = capsys.readouterr()
@@ -670,6 +673,7 @@ def test_oneshot_fails_closed_on_agent_exception(monkeypatch, capsys):
         raise OSError("not a TTY")
 
     monkeypatch.setattr(oneshot_mod, "_run_agent", _boom)
+    monkeypatch.setattr(oneshot_mod, "_hard_exit", lambda code: code)
 
     assert oneshot_mod.run_oneshot("hello") == 1
     captured = capsys.readouterr()
