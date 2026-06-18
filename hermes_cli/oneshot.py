@@ -211,19 +211,19 @@ def run_oneshot(
             raise failure
         real_stderr.write(f"hermes -z: agent failed: {failure}\n")
         real_stderr.flush()
-        _hard_exit(1)
+        return _hard_exit(1)
 
     if not (response or "").strip():
         real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
         real_stderr.flush()
-        _hard_exit(1)
+        return _hard_exit(1)
 
     assert response is not None  # narrowed by the empty-response guard above
     real_stdout.write(response)
     if not response.endswith("\n"):
         real_stdout.write("\n")
     real_stdout.flush()
-    _hard_exit(0)
+    return _hard_exit(0)
 
 
 def _hard_exit(code: int) -> "int":
