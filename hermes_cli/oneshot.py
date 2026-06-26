@@ -211,19 +211,57 @@ def run_oneshot(
             raise failure
         real_stderr.write(f"hermes -z: agent failed: {failure}\n")
         real_stderr.flush()
-        return 1
+        return _hard_exit(1)
 
     if not (response or "").strip():
         real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
         real_stderr.flush()
-        return 1
+        return _hard_exit(1)
 
     assert response is not None  # narrowed by the empty-response guard above
     real_stdout.write(response)
     if not response.endswith("\n"):
         real_stdout.write("\n")
     real_stdout.flush()
-    return 0
+    return _hard_exit(0)
+
+
+def _hard_exit(code: int) -> "int":
+    """Flush stdio/logging and terminate via ``os._exit``, bypassing
+    interpreter finalization.
+
+    ``_run_agent`` already ran the session-end teardown to flush memory and
+    join the memory provider's tracked background threads. But that provider
+    (Honcho) also spawns *untracked* fire-and-forget daemon threads for
+    mem-write / dialectic prefetch that can't be reliably joined; if one is
+    still blocked in an httpx request when ``Py_FinalizeEx`` runs, CPython
+    aborts the process ("Fatal Python error: Aborted", SIGABRT / exit 134)
+    while tearing that daemon thread down. The model output and the memory
+    write have both already completed by this point, so skipping the
+    daemon-thread teardown is safe and eliminates the cosmetic abort. Mirrors
+    the existing ``os._exit`` worker-exit pattern in cli.py. A SIGALRM deadman
+    guards the flush against the rare blocking-I/O case.
+
+    Returns its argument for type-checkers; in practice it never returns.
+    """
+    try:
+        import signal as _sig_mod
+        if hasattr(_sig_mod, "SIGALRM"):
+            _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(code))
+            _sig_mod.alarm(2)
+    except Exception:
+        pass
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+    return code  # unreachable; keeps the return-type contract
 
 
 def _create_session_db_for_oneshot():
@@ -364,7 +402,30 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    response = agent.chat(prompt) or ""
+
+    # Oneshot is a real session boundary: there's no REPL loop and no
+    # cli.py finalizer behind us (this path "bypasses cli.py entirely"),
+    # so the session-end teardown that the interactive / `-q` paths run
+    # via ``_finalize_single_query`` never fires here. Run it explicitly
+    # so memory providers flush their session and quiesce the background
+    # daemon threads they spawn (Honcho's prefetch / sync / dialectic /
+    # mem-write workers make blocking httpx calls). Without this, one of
+    # those daemon threads is still mid-request when ``Py_FinalizeEx``
+    # runs at process exit; CPython routes the live daemon thread through
+    # ``PyThread_exit_thread`` → ``pthread_exit``, which glibc turns into
+    # "Fatal Python error: Aborted" (SIGABRT / exit 134). Best-effort: a
+    # failure here must never mask the response we already produced.
+    try:
+        _msgs = getattr(agent, "_session_messages", None)
+        if isinstance(_msgs, list):
+            agent.shutdown_memory_provider(_msgs)
+        else:
+            agent.shutdown_memory_provider()
+    except Exception:
+        pass
+
+    return response
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

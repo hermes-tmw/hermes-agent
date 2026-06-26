@@ -1701,6 +1701,10 @@ AUTHOR_MAP = {
     "qs2816661685@gmail.com": "qingshan89",  # PR #46895 co-author (desktop remote artifact download)
     "yspdev@gmail.com": "AJ",  # PR #44510 co-author (desktop named-profile boot loop)
     "steveonjava@gmail.com": "steveonjava",  # PR #29669 (redact secrets in kanban tool payloads)
+    "hermes-tmw@github.com": "hermes-tmw",  # Hermes AI agent account
+    "mail@tomwhipple.com": "tomwhipple",  # Tom Whipple (repo owner)
+    "hermes@tomwhipple.com": "hermes-tmw",  # Hermes AI agent account (alternate)
+    "claw@localhost": "claw",  # local dev user; appears in PR history
 }
 
 
