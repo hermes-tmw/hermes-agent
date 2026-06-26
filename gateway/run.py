@@ -2543,6 +2543,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    _home_channel_startup_notification_sent: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -2655,6 +2656,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = False
         self._startup_restore_queue: List[MessageEvent] = []
         self._startup_restore_tasks: List[asyncio.Task] = []
+        self._home_channel_startup_notification_sent = False
         # LRU cache of live SessionSources keyed by session_key. Used by
         # fallback routing paths (shutdown notifications, synthetic
         # background-process events) when the persisted origin is missing
@@ -6248,18 +6250,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         planned_restart_notification_pending = _planned_restart_notification_pending()
         await self._send_restart_notification()
 
-        # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
-        if planned_restart_notification_pending:
+        # Broadcast a lightweight "gateway started" message to configured home
+        # channels on every boot. Only send once per process; reconnects within
+        # the same boot reuse the existing adapter connections and do not re-run
+        # this startup block.
+        if connected_count > 0 and not self._home_channel_startup_notification_sent:
             try:
                 await self._send_home_channel_startup_notifications(
-                    skip_targets=None,
+                    message=":large_green_circle: Hermes gateway started",
                 )
-            finally:
-                _clear_planned_restart_notification()
+            except Exception:
+                logger.warning(
+                    "Home-channel startup notification failed",
+                    exc_info=True,
+                )
+
+        # Clear the legacy planned-restart marker if present. The unconditional
+        # startup broadcast above now covers non-chat restarts; keeping the
+        # marker would leak state across boots.
+        if planned_restart_notification_pending:
+            _clear_planned_restart_notification()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -13231,16 +13241,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        message: Optional[str] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify configured home channels that the gateway is back online.
 
         The notification is best-effort and sent once per connected platform
         home channel. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
+        ``message`` overrides the default lifecycle text.
+
+        Idempotent: only the first call sends messages; later calls are no-ops.
         """
+        if self._home_channel_startup_notification_sent:
+            return set()
+        self._home_channel_startup_notification_sent = True
+
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        if message is None:
+            message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)

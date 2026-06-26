@@ -688,3 +688,57 @@ async def test_restart_shutdown_notification_anchors_telegram_dm_topic():
         "direct_messages_topic_id": "20197",
         "telegram_reply_to_message_id": "462",
     }
+
+
+# ── startup notification message and idempotency ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_uses_custom_message(
+    tmp_path, monkeypatch
+):
+    """The message parameter overrides the default lifecycle text."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock()
+
+    delivered = await runner._send_home_channel_startup_notifications(
+        message=":large_green_circle: Hermes gateway started",
+    )
+
+    assert delivered == {("telegram", "home-42", None)}
+    adapter.send.assert_called_once_with(
+        "home-42",
+        ":large_green_circle: Hermes gateway started",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_idempotent_in_start_sequence(
+    tmp_path, monkeypatch
+):
+    """The flag set during start() prevents duplicate home-channel startup pings."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock()
+
+    runner._home_channel_startup_notification_sent = True
+    delivered = await runner._send_home_channel_startup_notifications(
+        message=":large_green_circle: Hermes gateway started",
+    )
+
+    assert runner._home_channel_startup_notification_sent is True
+    assert delivered == set()
+    adapter.send.assert_not_called()
