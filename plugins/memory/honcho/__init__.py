@@ -36,14 +36,12 @@ logger = logging.getLogger(__name__)
 # Graph-memory helpers (direct HTTP, not in the Honcho SDK yet)
 # ---------------------------------------------------------------------------
 
-# Observation IDs in this backend are nanoids (21 chars). Graph-memory
-# endpoints use them as opaque path segments; we validate the shape so
-# path injection can't slip through.
-_OBS_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 # Thread IDs must match the backend's ThreadBindingCreate pattern.
-_THREAD_ID_RE = re.compile(r"^[0-9]{10,}\.[0-9]+$")
+_THREAD_ID_RE = re.compile(r"^[0-9]{10,64}\.[0-9]{1,20}$")
 # Context names must match the backend's ContextCreate pattern.
 _CONTEXT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# Collection names must match the backend's collection naming rules.
+_COLLECTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_:-]{1,128}$")
 # Peer IDs may contain colons (configured peer_name, workspace-scoped IDs)
 # but MUST NOT contain path-traversal characters, query strings, or whitespace.
 _PEER_ID_RE = re.compile(r"^[a-zA-Z0-9_:-]{1,128}$")
@@ -237,8 +235,8 @@ RECALL_SCHEMA = {
             },
             "max_results": {
                 "type": "integer",
-                "description": "Maximum number of results to return (100-10000).",
-                "default": 2000,
+                "description": "Token budget for results (100-10000).",
+                "default": 1000,
                 "minimum": 100,
                 "maximum": 10000,
             },
@@ -271,7 +269,7 @@ RECALL_CONTEXT_SCHEMA = {
             },
             "context_name": {
                 "type": "string",
-                "description": "Name of the context to switch to, activate, create, or list.",
+                "description": "Name of the context. Required for switch/activate/create/list_members. Omit only for evict.",
             },
             "peer": {
                 "type": "string",
@@ -344,18 +342,19 @@ class HonchoMemoryProvider(MemoryProvider):
             # manager for canonical peer IDs if a session is ready.
             if self._manager and self._session_ready():
                 try:
-                    if peer == "user":
-                        # Runtime user peer may differ from config peer_name
+                    session = self._manager._cache.get(self._session_key) if self._manager else None
+                    if session:
+                        if peer == "user":
+                            return (
+                                session.user_peer_id
+                                or (self._config.peer_name if self._config else None)
+                                or "user"
+                            )
                         return (
-                            getattr(self._manager, "_user_peer_id", None)
-                            or (self._config.peer_name if self._config else None)
-                            or "user"
+                            session.assistant_peer_id
+                            or (self._config.ai_peer if self._config else None)
+                            or "ai"
                         )
-                    return (
-                        getattr(self._manager, "_assistant_peer_id", None)
-                        or (self._config.ai_peer if self._config else None)
-                        or "ai"
-                    )
                 except Exception:
                     pass
             if peer == "user":
@@ -415,7 +414,7 @@ class HonchoMemoryProvider(MemoryProvider):
         url = self._graph_memory_url(path)
         headers = self._graph_memory_headers()
         try:
-            with httpx.Client(timeout=timeout) as client:
+            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
                 if method.upper() == "GET":
                     resp = client.get(url, headers=headers)
                 elif method.upper() == "POST":
@@ -1677,13 +1676,16 @@ class HonchoMemoryProvider(MemoryProvider):
                 collection_name = (args.get("collection_name") or "").strip()
                 if not collection_name:
                     collection_name = self._config.workspace_id if self._config else "hermes"
+                elif not _COLLECTION_NAME_RE.match(collection_name):
+                    return tool_error("Invalid collection_name format.")
 
                 max_depth = max(1, min(int(args.get("max_depth", 3)), 10))
-                max_results = max(100, min(int(args.get("max_results", 2000)), 10000))
+                max_results = max(100, min(int(args.get("max_results", 1000)), 10000))
                 context = args.get("context")
                 if context is not None and not _CONTEXT_NAME_RE.match(str(context)):
                     return tool_error("Invalid context_name format.")
-                include_pinned = bool(args.get("include_pinned", True))
+                include_pinned_raw = args.get("include_pinned", True)
+                include_pinned = include_pinned_raw is not False and include_pinned_raw not in ("false", "0", "")
 
                 if not self._graph_memory_available():
                     return tool_error("Honcho graph memory is not available on this backend.")
@@ -1700,7 +1702,10 @@ class HonchoMemoryProvider(MemoryProvider):
                     body["context"] = context
 
                 result = self._graph_memory_call("POST", "recall", json_body=body, timeout=30.0)
-                return json.dumps({"result": result})
+                result_str = json.dumps({"result": result})
+                if len(result_str) > 32768:  # 32KB cap
+                    result_str = result_str[:32768] + '... (truncated)"}'
+                return result_str
 
             elif tool_name == "honcho_recall_context":
                 action = (args.get("action") or "switch").strip().lower()
@@ -1783,6 +1788,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
         except Exception as e:
             logger.error("Honcho tool %s failed: %s", tool_name, e)
+            if tool_name.startswith("honcho_recall") or tool_name == "honcho_thread_bind":
+                return tool_error(f"Honcho {tool_name} failed.")
             return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
