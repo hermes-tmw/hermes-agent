@@ -487,13 +487,18 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_first_failure_at: Optional[float] = None
         self._socket_consecutive_failures: int = 0
         self._socket_escalation_fired: bool = False
-        self._socket_restart_fired: bool = False
+        # NOTE: We deliberately do NOT auto-restart the gateway from inside the
+        # Slack adapter. Restarting the whole gateway tears down every other
+        # channel (Signal, email, Telegram, cron, etc.) for a Slack-only
+        # problem, and it cannot fix a Slack-side outage — it just loops.
+        # Kept as an always-false toggle so the config key still parses but
+        # the dangerous path is dead code by construction.
+        self._auto_restart_on_prolonged_disconnect: bool = False
         # Configurable thresholds / command, read from config.yaml via the
         # _apply_yaml_config bridge below. Defaults mirror the constants above.
         self._prolonged_disconnect_warning_attempts: int = _SLACK_PROLONGED_DISCONNECT_WARNING_ATTEMPTS
         self._prolonged_disconnect_threshold_s: float = _SLACK_PROLONGED_DISCONNECT_THRESHOLD_S
         self._auto_restart_threshold_s: float = _SLACK_AUTO_RESTART_THRESHOLD_S
-        self._auto_restart_on_prolonged_disconnect: bool = True
         self._prolonged_disconnect_escalation_command: str = ""
 
     def _start_socket_mode_handler(self) -> None:
@@ -643,22 +648,9 @@ class SlackAdapter(BasePlatformAdapter):
             )
             await self._run_prolonged_disconnect_escalation_command()
 
-        # 15-minute threshold: exit the process non-zero so the service manager
-        # restarts the gateway, unless auto-restart is disabled.
-        if (
-            self._auto_restart_on_prolonged_disconnect
-            and not self._socket_restart_fired
-            and elapsed >= self._auto_restart_threshold_s
-        ):
-            self._socket_restart_fired = True
-            logger.error(
-                "[Slack] Socket Mode disconnected for %.1fs (attempt=%d); "
-                "exiting process for service-manager restart.",
-                elapsed, attempt,
-            )
-            # Give the log line a moment to flush before we tear down.
-            await asyncio.sleep(0.05)
-            os._exit(1)
+        # NOTE: Auto-restart via os._exit(1) is intentionally disabled.
+        # The config key still parses (default false) for backward compatibility,
+        # but the adapter never exits the gateway. See __init__ comment for why.
 
     async def _run_prolonged_disconnect_escalation_command(self) -> None:
         """Run the configured escalation shell command, if any.
@@ -1076,10 +1068,9 @@ class SlackAdapter(BasePlatformAdapter):
                 os.getenv("SLACK_AUTO_RESTART_THRESHOLD_SECONDS"),
                 _SLACK_AUTO_RESTART_THRESHOLD_S,
             )
-            self._auto_restart_on_prolonged_disconnect = _coerce_bool(
-                os.getenv("SLACK_AUTO_RESTART_ON_PROLONGED_DISCONNECT"),
-                True,
-            )
+            # Auto-restart is disabled by design; the config key is still
+            # parsed so existing config.yaml files don't raise errors.
+            self._auto_restart_on_prolonged_disconnect = False
             self._prolonged_disconnect_escalation_command = str(
                 os.getenv("SLACK_PROLONGED_DISCONNECT_ESCALATION_COMMAND") or ""
             )
