@@ -172,7 +172,7 @@ def detect_audio_environment() -> dict:
                 "    # or: export PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native"
             )
 
-    # Docker/Podman container detection — honor host audio forwarding.
+    # Docker/Podman container detection -- honor host audio forwarding.
     # When the user mounts a PulseAudio/PipeWire socket into the container
     # and points PULSE_SERVER / PIPEWIRE_REMOTE at it, audio works fine
     # (issue #21203).  Only block when no forwarding is configured.
@@ -190,7 +190,7 @@ def detect_audio_environment() -> dict:
                 "    PipeWire:    -e PIPEWIRE_REMOTE=$XDG_RUNTIME_DIR/pipewire-0"
             )
 
-    # WSL detection — PulseAudio bridge makes audio work in WSL.
+    # WSL detection -- PulseAudio bridge makes audio work in WSL.
     # Only block if PULSE_SERVER is not configured.
     try:
         with open('/proc/version', 'r', encoding="utf-8") as f:
@@ -319,7 +319,7 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
 
         audio = np.concatenate(parts)
         sd.play(audio, samplerate=SAMPLE_RATE)
-        # sd.wait() calls Event.wait() without timeout — hangs forever if the
+        # sd.wait() calls Event.wait() without timeout -- hangs forever if the
         # audio device stalls.  Poll with a 2s ceiling and force-stop.
         deadline = time.monotonic() + 2.0
         while sd.get_stream() and sd.get_stream().active and time.monotonic() < deadline:
@@ -474,17 +474,31 @@ class AudioRecorder:
 
     If ``on_silence_stop`` is provided, recording automatically stops when
     the user is silent for ``silence_duration`` seconds and calls the callback.
+
+    VAD provider selection:
+
+    * ``voice.vad.provider`` controls whether Silero VAD (``"silero"``) or the
+      legacy RMS detector (``"rms"``) is used.  The default is ``"rms"`` for
+      backward compatibility.
+    * Silero parameters live under ``voice.vad.silero.*``.
+    * If the Silero model is missing or onnxruntime fails to load, the recorder
+      logs a warning and falls back to RMS.
     """
 
     supports_silence_autostop = True
 
-    def __init__(self) -> None:
+    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self._lock = threading.Lock()
         self._stream: Any = None
         self._frames: List[Any] = []
         self._recording = False
         self._start_time: float = 0.0
-        # Silence detection state
+        # VAD state
+        self._vad: Any = None
+        self._vad_config: Any = None
+        self._vad_is_fallback = False
+        self._config_source: Optional[Dict[str, Any]] = config
+        # Legacy RMS detection state (kept for RMSVAD and level display)
         self._has_spoken = False
         self._speech_start: float = 0.0  # When speech attempt began
         self._dip_start: float = 0.0  # When current below-threshold dip began
@@ -501,6 +515,8 @@ class AudioRecorder:
         self._peak_rms: int = 0
         # Live audio level (read by UI for visual feedback)
         self._current_rms: int = 0
+        # Expose VAD name for diagnostics ("silero", "rms", "rms_fallback")
+        self._vad_provider: str = "rms"
 
     # -- public properties ---------------------------------------------------
 
@@ -520,6 +536,151 @@ class AudioRecorder:
         """Whether audio recording is currently active."""
         return self._recording
 
+    @property
+    def vad_provider(self) -> str:
+        """Active VAD provider name (``silero`` or ``rms`` / ``rms_fallback``)."""
+        # Lazily initialize VAD so the provider is correct even before
+        # recording starts (tests check it immediately after construction).
+        if self._vad is None:
+            self._ensure_vad()
+        return self._vad_provider
+
+    # -- VAD setup -----------------------------------------------------------
+
+    def _ensure_vad(self) -> None:
+        """Initialize the configured VAD instance exactly once."""
+        if self._vad is not None:
+            return
+        from tools.vad import VADConfig, load_vad_from_config
+
+        cfg = load_vad_from_config(self._config_source)
+        self._vad_config = cfg
+        self._vad = None
+        # load_vad_from_config returns (vad, config, is_fallback)
+        vad_tuple = load_vad_from_config(self._config_source)
+        self._vad = vad_tuple[0]
+        self._vad_config = vad_tuple[1]
+        self._vad_is_fallback = vad_tuple[2]
+
+        cls_name = type(self._vad).__name__
+        if cls_name == "SileroVAD":
+            self._vad_provider = "silero"
+        elif cls_name == "RMSVAD":
+            self._vad_provider = "rms_fallback" if self._vad_is_fallback else "rms"
+        else:
+            self._vad_provider = "rms"
+
+        if self._vad_is_fallback:
+            logger.warning("Using RMS VAD fallback (Silero unavailable)")
+
+        # Keep legacy RMS fields in sync with config for level display and
+        # downstream code that reads _silence_threshold / _silence_duration.
+        if isinstance(self._vad_config, VADConfig) and self._vad_config.provider == "rms":
+            self._silence_threshold = int(self._vad_config.threshold)
+            self._silence_duration = self._vad_config.min_silence_ms / 1000.0
+        elif self._vad_is_fallback:
+            # Fallback keeps historical defaults for any caller reading them.
+            self._silence_threshold = SILENCE_RMS_THRESHOLD
+            self._silence_duration = SILENCE_DURATION_SECONDS
+
+    def _reset_vad_state(self) -> None:
+        """Reset VAD state for a new recording."""
+        self._has_spoken = False
+        self._speech_start = 0.0
+        self._dip_start = 0.0
+        self._silence_start = 0.0
+        self._resume_start = 0.0
+        self._resume_dip_start = 0.0
+        if self._vad is not None and hasattr(self._vad, "reset"):
+            if self._vad_provider == "silero":
+                self._vad.reset()
+            else:
+                self._vad.reset(self._start_time)
+
+    def _vad_update(self, indata: Any, rms: int) -> bool:
+        """Feed one chunk into the VAD and return True if endpoint reached."""
+        self._ensure_vad()
+        if self._vad is None:
+            return False
+
+        now = time.monotonic()
+        elapsed = now - self._start_time
+
+        if self._vad_provider == "silero":
+            # The SileroVAD instance is stateful; each audio chunk is passed to
+            # detect_endpoint, which accumulates history in the LSTM state.
+            return self._vad.detect_endpoint(indata.copy(), SAMPLE_RATE)
+
+        # RMS path -- delegate to the dedicated RMS helper to keep the callback
+        # readable and identical to the pre-Silero behavior.
+        return self._rms_vad_update(rms, now, elapsed)
+
+    def _rms_vad_update(self, rms: int, now: float, elapsed: float) -> bool:
+        """Legacy RMS endpoint logic, kept identical to pre-Silero behavior."""
+        if rms > self._silence_threshold:
+            # Audio is above threshold -- this is speech (or noise).
+            self._dip_start = 0.0  # Reset dip tracker
+            if self._speech_start == 0.0:
+                self._speech_start = now
+            elif not self._has_spoken and now - self._speech_start >= self._min_speech_duration:
+                self._has_spoken = True
+                logger.debug("Speech confirmed (%.2fs above threshold)",
+                             now - self._speech_start)
+            # After speech is confirmed, only reset silence timer if
+            # speech is sustained (>0.3s above threshold).  Brief
+            # spikes from ambient noise should NOT reset the timer.
+            if not self._has_spoken:
+                self._silence_start = 0.0
+            else:
+                # Track resumed speech with dip tolerance.
+                # Brief dips below threshold are normal during speech,
+                # so we mirror the initial speech detection pattern:
+                # start tracking, tolerate short dips, confirm after 0.3s.
+                self._resume_dip_start = 0.0  # Above threshold -- no dip
+                if self._resume_start == 0.0:
+                    self._resume_start = now
+                elif now - self._resume_start >= self._min_speech_duration:
+                    self._silence_start = 0.0
+                    self._resume_start = 0.0
+        elif self._has_spoken:
+            # Below threshold after speech confirmed.
+            # Use dip tolerance before resetting resume tracker --
+            # natural speech has brief dips below threshold.
+            if self._resume_start > 0:
+                if self._resume_dip_start == 0.0:
+                    self._resume_dip_start = now
+                elif now - self._resume_dip_start >= self._max_dip_tolerance:
+                    # Sustained dip -- user actually stopped speaking
+                    self._resume_start = 0.0
+                    self._resume_dip_start = 0.0
+        elif self._speech_start > 0:
+            # We were in a speech attempt but RMS dipped.
+            # Tolerate brief dips (micro-pauses between syllables).
+            if self._dip_start == 0.0:
+                self._dip_start = now
+            elif now - self._dip_start >= self._max_dip_tolerance:
+                # Dip lasted too long -- genuine silence, reset
+                logger.debug("Speech attempt reset (dip lasted %.2fs)",
+                             now - self._dip_start)
+                self._speech_start = 0.0
+                self._dip_start = 0.0
+
+        # Fire silence callback when:
+        # 1. User spoke then went silent for silence_duration, OR
+        # 2. No speech detected at all for max_wait seconds
+        if self._has_spoken and rms <= self._silence_threshold:
+            if self._silence_start == 0.0:
+                self._silence_start = now
+            elif now - self._silence_start >= self._silence_duration:
+                logger.info("Silence detected (%.1fs), auto-stopping",
+                            self._silence_duration)
+                return True
+        elif not self._has_spoken and elapsed >= self._max_wait:
+            logger.info("No speech within %.0fs, auto-stopping",
+                        self._max_wait)
+            return True
+        return False
+
     # -- public methods ------------------------------------------------------
 
     def _ensure_stream(self) -> None:
@@ -538,7 +699,7 @@ class AudioRecorder:
         def _callback(indata, frames, time_info, status):  # noqa: ARG001
             if status:
                 logger.debug("sounddevice status: %s", status)
-            # When not recording the stream is idle — discard audio.
+            # When not recording the stream is idle -- discard audio.
             if not self._recording:
                 return
             self._frames.append(indata.copy())
@@ -550,74 +711,7 @@ class AudioRecorder:
 
             # Silence detection
             if self._on_silence_stop is not None:
-                now = time.monotonic()
-                elapsed = now - self._start_time
-
-                if rms > self._silence_threshold:
-                    # Audio is above threshold -- this is speech (or noise).
-                    self._dip_start = 0.0  # Reset dip tracker
-                    if self._speech_start == 0.0:
-                        self._speech_start = now
-                    elif not self._has_spoken and now - self._speech_start >= self._min_speech_duration:
-                        self._has_spoken = True
-                        logger.debug("Speech confirmed (%.2fs above threshold)",
-                                     now - self._speech_start)
-                    # After speech is confirmed, only reset silence timer if
-                    # speech is sustained (>0.3s above threshold).  Brief
-                    # spikes from ambient noise should NOT reset the timer.
-                    if not self._has_spoken:
-                        self._silence_start = 0.0
-                    else:
-                        # Track resumed speech with dip tolerance.
-                        # Brief dips below threshold are normal during speech,
-                        # so we mirror the initial speech detection pattern:
-                        # start tracking, tolerate short dips, confirm after 0.3s.
-                        self._resume_dip_start = 0.0  # Above threshold — no dip
-                        if self._resume_start == 0.0:
-                            self._resume_start = now
-                        elif now - self._resume_start >= self._min_speech_duration:
-                            self._silence_start = 0.0
-                            self._resume_start = 0.0
-                elif self._has_spoken:
-                    # Below threshold after speech confirmed.
-                    # Use dip tolerance before resetting resume tracker —
-                    # natural speech has brief dips below threshold.
-                    if self._resume_start > 0:
-                        if self._resume_dip_start == 0.0:
-                            self._resume_dip_start = now
-                        elif now - self._resume_dip_start >= self._max_dip_tolerance:
-                            # Sustained dip — user actually stopped speaking
-                            self._resume_start = 0.0
-                            self._resume_dip_start = 0.0
-                elif self._speech_start > 0:
-                    # We were in a speech attempt but RMS dipped.
-                    # Tolerate brief dips (micro-pauses between syllables).
-                    if self._dip_start == 0.0:
-                        self._dip_start = now
-                    elif now - self._dip_start >= self._max_dip_tolerance:
-                        # Dip lasted too long -- genuine silence, reset
-                        logger.debug("Speech attempt reset (dip lasted %.2fs)",
-                                     now - self._dip_start)
-                        self._speech_start = 0.0
-                        self._dip_start = 0.0
-
-                # Fire silence callback when:
-                # 1. User spoke then went silent for silence_duration, OR
-                # 2. No speech detected at all for max_wait seconds
-                should_fire = False
-                if self._has_spoken and rms <= self._silence_threshold:
-                    # User was speaking and now is silent
-                    if self._silence_start == 0.0:
-                        self._silence_start = now
-                    elif now - self._silence_start >= self._silence_duration:
-                        logger.info("Silence detected (%.1fs), auto-stopping",
-                                    self._silence_duration)
-                        should_fire = True
-                elif not self._has_spoken and elapsed >= self._max_wait:
-                    logger.info("No speech within %.0fs, auto-stopping",
-                                self._max_wait)
-                    should_fire = True
-
+                should_fire = self._vad_update(indata, rms)
                 if should_fire:
                     with self._lock:
                         cb = self._on_silence_stop
@@ -630,7 +724,7 @@ class AudioRecorder:
                                 logger.error("Silence callback failed: %s", e, exc_info=True)
                         threading.Thread(target=_safe_cb, daemon=True).start()
 
-        # Create stream — may block on CoreAudio (first call only).
+        # Create stream -- may block on CoreAudio (first call only).
         stream = None
         try:
             stream = sd.InputStream(
@@ -694,9 +788,14 @@ class AudioRecorder:
         # Ensure the persistent stream is alive (no-op after first call).
         self._ensure_stream()
 
+        # VAD must be initialized while _recording is still False so that a
+        # missing model/onnxruntime raises here and can be surfaced cleanly.
+        self._ensure_vad()
+        self._reset_vad_state()
+
         with self._lock:
             self._recording = True
-        logger.info("Voice recording started (rate=%d, channels=%d)", SAMPLE_RATE, CHANNELS)
+        logger.info("Voice recording started (rate=%d, channels=%d, vad=%s)", SAMPLE_RATE, CHANNELS, self._vad_provider)
 
     def _close_stream_with_timeout(self, timeout: float = 3.0) -> None:
         """Close the audio stream with a timeout to prevent CoreAudio hangs."""
@@ -720,12 +819,12 @@ class AudioRecorder:
         while t.is_alive() and __import__("time").monotonic() < deadline:
             t.join(timeout=0.1)
         if t.is_alive():
-            logger.warning("Audio stream close timed out after %.1fs — forcing ahead", timeout)
+            logger.warning("Audio stream close timed out after %.1fs -- forcing ahead", timeout)
 
     def stop(self) -> Optional[str]:
         """Stop recording and write captured audio to a WAV file.
 
-        The underlying stream is kept alive for reuse — only frame
+        The underlying stream is kept alive for reuse -- only frame
         collection is stopped.
 
         Returns:
@@ -737,7 +836,7 @@ class AudioRecorder:
 
             self._recording = False
             self._current_rms = 0
-            # Stream stays alive — no close needed.
+            # Stream stays alive -- no close needed.
 
             if not self._frames:
                 return None
@@ -810,11 +909,39 @@ class AudioRecorder:
         return wav_path
 
 
-def create_audio_recorder() -> AudioRecorder | TermuxAudioRecorder:
-    """Return the best recorder backend for the current environment."""
+def create_audio_recorder(config: Optional[Dict[str, Any]] = None) -> Any:
+    """Return the best recorder backend for the current environment.
+
+    Args:
+        config: Optional Hermes config dict used to select the VAD provider.
+    """
     if _termux_voice_capture_available():
         return TermuxAudioRecorder()
-    return AudioRecorder()
+    return AudioRecorder(config=config)
+
+
+# ============================================================================
+# VAD utilities exposed for callers that need provider-aware detection
+# ============================================================================
+def _silero_vad_available(model_path: Optional[str] = None) -> bool:
+    """Return True if the Silero model file and onnxruntime are loadable."""
+    from tools.vad import _default_silero_model_path
+
+    path = model_path or _default_silero_model_path()
+    if not os.path.isfile(path):
+        return False
+    try:
+        import onnxruntime  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _load_vad_config(config: Optional[Dict[str, Any]] = None):
+    """Return a normalized VADConfig from the provided Hermes config dict."""
+    from tools.vad import vad_config_from_dict
+
+    return vad_config_from_dict(config)
 
 
 # ============================================================================
@@ -1069,7 +1196,7 @@ def play_audio_file(file_path: str) -> bool:
                 sample_rate = wf.getframerate()
 
             sd.play(audio_data, samplerate=sample_rate)
-            # sd.wait() calls Event.wait() without timeout — hangs forever if
+            # sd.wait() calls Event.wait() without timeout -- hangs forever if
             # the audio device stalls.  Poll with a ceiling and force-stop.
             duration_secs = len(audio_data) / sample_rate
             deadline = time.monotonic() + duration_secs + 2.0
@@ -1165,7 +1292,7 @@ def check_voice_requirements() -> Dict[str, Any]:
         details_parts.append("STT provider: OK (OpenAI)")
     else:
         details_parts.append(
-            "STT provider: MISSING (uv pip install faster-whisper — "
+            "STT provider: MISSING (uv pip install faster-whisper -- "
             "`pip install faster-whisper` also works if pip is on PATH, "
             "or set GROQ_API_KEY / VOICE_TOOLS_OPENAI_KEY)"
         )
