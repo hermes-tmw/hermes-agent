@@ -2092,6 +2092,7 @@ DEFAULT_CONFIG = {
                 "silence_duration": 3.0,  # Seconds of silence before auto-stop
             },
         },
+        "barge_in": True,  # Allow remote frontends to interrupt TTS playback
     },
     
     "human_delay": {

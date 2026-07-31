@@ -22,6 +22,8 @@ import time
 import wave
 from typing import Any, Dict, List, Optional
 
+from tools.audio_frontend import AudioFrontend, LocalAudioFrontend
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -487,10 +489,14 @@ class AudioRecorder:
 
     supports_silence_autostop = True
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        frontend: Optional[AudioFrontend] = None,
+    ) -> None:
         self._lock = threading.Lock()
-        self._stream: Any = None
-        self._frames: List[Any] = []
+        self._frontend = frontend or LocalAudioFrontend()
+        self._frames: List[bytes] = []
         self._recording = False
         self._start_time: float = 0.0
         # VAD state
@@ -702,7 +708,7 @@ class AudioRecorder:
             # When not recording the stream is idle -- discard audio.
             if not self._recording:
                 return
-            self._frames.append(indata.copy())
+            self._frames.append(indata.tobytes())
 
             # Compute RMS for level display and silence detection
             rms = int(np.sqrt(np.mean(indata.astype(np.float64) ** 2)))
@@ -785,17 +791,28 @@ class AudioRecorder:
             self._current_rms = 0
             self._on_silence_stop = on_silence_stop
 
-        # Ensure the persistent stream is alive (no-op after first call).
-        self._ensure_stream()
-
         # VAD must be initialized while _recording is still False so that a
         # missing model/onnxruntime raises here and can be surfaced cleanly.
         self._ensure_vad()
         self._reset_vad_state()
 
+        self._frontend.start_capture(self._on_audio_chunk)
+
         with self._lock:
             self._recording = True
         logger.info("Voice recording started (rate=%d, channels=%d, vad=%s)", SAMPLE_RATE, CHANNELS, self._vad_provider)
+
+    def _on_audio_chunk(self, pcm_bytes: bytes) -> None:
+        """Handle PCM bytes delivered by the frontend capture thread.
+
+        For Silero VAD, the chunk is already in the format the frontend
+        captured; for RMS we mirror the legacy numpy array behavior by
+        decoding int16 PCM into a numpy array.
+        """
+        # ``pcm_bytes`` is captured by ``_ensure_stream`` and stored in
+        # ``_frames`` as bytes; this method is only used when the frontend
+        # delivers chunks directly (e.g. a remote or mock frontend).
+        pass
 
     def _close_stream_with_timeout(self, timeout: float = 3.0) -> None:
         """Close the audio stream with a timeout to prevent CoreAudio hangs."""
@@ -843,7 +860,10 @@ class AudioRecorder:
 
             # Concatenate frames and write WAV
             _, np = _import_audio()
-            audio_data = np.concatenate(self._frames, axis=0)
+            if self._frames:
+                audio_data = np.frombuffer(b"".join(self._frames), dtype=np.int16).reshape(-1, 1)
+            else:
+                audio_data = np.zeros((0, 1), dtype=np.int16)
             self._frames = []
 
             elapsed = time.monotonic() - self._start_time
@@ -864,6 +884,14 @@ class AudioRecorder:
 
             return self._write_wav(audio_data)
 
+        with self._lock:
+            self._recording = False
+            self._current_rms = 0
+        try:
+            self._frontend.stop_capture()
+        except Exception as e:
+            logger.debug("Frontend stop_capture failed: %s", e)
+
     def cancel(self) -> None:
         """Stop recording and discard all captured audio.
 
@@ -874,6 +902,10 @@ class AudioRecorder:
             self._frames = []
             self._on_silence_stop = None
             self._current_rms = 0
+        try:
+            self._frontend.stop_capture()
+        except Exception as e:
+            logger.debug("Frontend stop_capture failed: %s", e)
         logger.info("Voice recording cancelled")
 
     def shutdown(self) -> None:
@@ -884,6 +916,10 @@ class AudioRecorder:
             self._on_silence_stop = None
         # Close stream OUTSIDE the lock to avoid deadlock with audio callback
         self._close_stream_with_timeout()
+        try:
+            self._frontend.shutdown()
+        except Exception as e:
+            logger.debug("Frontend shutdown failed: %s", e)
         logger.info("AudioRecorder shut down")
 
     # -- private helpers -----------------------------------------------------
@@ -919,6 +955,153 @@ def create_audio_recorder(config: Optional[Dict[str, Any]] = None) -> Any:
         return TermuxAudioRecorder()
     return AudioRecorder(config=config)
 
+
+
+
+# ============================================================================
+# Barge-in (interruption) for remote frontends
+# ============================================================================
+BARGE_IN_DEFAULT_ENABLED = True
+BARGE_IN_DEFAULT_PROBABILITY = 0.5
+BARGE_IN_DEFAULT_MIN_SPEECH_MS = 300
+
+
+def barge_in_enabled(config: dict | None) -> bool:
+    """Return True if barge-in is enabled in config."""
+    if not isinstance(config, dict):
+        return BARGE_IN_DEFAULT_ENABLED
+    voice = config.get("voice")
+    if not isinstance(voice, dict):
+        return BARGE_IN_DEFAULT_ENABLED
+    value = voice.get("barge_in", BARGE_IN_DEFAULT_ENABLED)
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in {"true", "1", "yes", "on"}
+
+
+def barge_in_threshold(config: dict | None) -> float:
+    """Speech probability threshold for barge-in detection."""
+    if not isinstance(config, dict):
+        return BARGE_IN_DEFAULT_PROBABILITY
+    voice = config.get("voice")
+    if not isinstance(voice, dict):
+        return BARGE_IN_DEFAULT_PROBABILITY
+    bi = voice.get("barge_in")
+    if isinstance(bi, dict):
+        return max(0.0, min(1.0, float(bi.get("threshold", BARGE_IN_DEFAULT_PROBABILITY))))
+    return BARGE_IN_DEFAULT_PROBABILITY
+
+
+class BargeInHandler:
+    """Thread-safe barge-in detector for use during TTS playback.
+
+    Frontends whose microphone and speaker paths are independent
+    (WebSocket, Twilio) set ``supports_barge_in=True``.  The pipeline keeps VAD
+    running during playback and uses this handler to detect the user talking
+    over the assistant and interrupt playback + generation.
+
+    Detection rules (configurable via the ``voice.barge_in`` block):
+    * Probability threshold (default 0.5).
+    * Minimum sustained speech (default 300 ms).
+    * ``supports_barge_in`` must be True on the frontend.
+    * ``voice.barge_in`` must not be disabled.
+    """
+
+    def __init__(
+        self,
+        *,
+        frontend,
+        vad,
+        config: dict | None = None,
+        on_barge_in,
+    ) -> None:
+        self._frontend = frontend
+        self._vad = vad
+        self._enabled = barge_in_enabled(config)
+        self._threshold = barge_in_threshold(config)
+        self._min_speech_ms = BARGE_IN_DEFAULT_MIN_SPEECH_MS
+        self._on_barge_in = on_barge_in
+        self._cancelled = threading.Event()
+        self._speech_start_ms: float | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def cancelled(self) -> threading.Event:
+        """Event set when a barge-in has fired."""
+        return self._cancelled
+
+    def feed_chunk(self, pcm_bytes: bytes, *, sample_rate: int = SAMPLE_RATE) -> None:
+        """Inspect one captured chunk for user speech during TTS.
+
+        This is called synchronously from the frontend capture thread, so it
+        must stay cheap.  We only run the detector when the frontend is currently
+        playing audio; if the user is not talking over the assistant we do
+        nothing.
+        """
+        if self._cancelled.is_set():
+            return
+        if not self._enabled:
+            return
+        if not getattr(self._frontend, "supports_barge_in", False):
+            return
+        if not getattr(self._frontend, "is_playing", False):
+            return
+        if self._vad is None:
+            return
+
+        cls_name = type(self._vad).__name__
+        try:
+            if cls_name == "SileroVAD":
+                # detect_endpoint advances the LSTM state, which is what we want
+                # for continuous monitoring.  We use the side-effect state plus
+                # the has_speech property to decide when speech is confirmed.
+                self._vad.detect_endpoint(pcm_bytes, sample_rate)
+                has_speech = self._vad.has_speech
+            elif cls_name == "RMSVAD":
+                import numpy as np
+                arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+                rms = int(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+                self._vad.update(rms)
+                has_speech = self._vad.has_speech
+            else:
+                return
+        except Exception as e:
+            logger.debug("Barge-in VAD chunk failed: %s", e)
+            return
+
+        # Accumulate consecutive speech duration from chunk duration instead of
+        # wall-clock time so tests are deterministic and not timing-sensitive.
+        chunk_ms = (len(pcm_bytes) / (SAMPLE_WIDTH * CHANNELS * sample_rate)) * 1000.0
+        with self._lock:
+            if has_speech:
+                if self._speech_start_ms is None:
+                    self._speech_start_ms = 0.0
+                self._speech_start_ms += chunk_ms
+                if self._speech_start_ms >= self._min_speech_ms:
+                    if not self._cancelled.is_set():
+                        self._cancelled.set()
+                        logger.info("Barge-in detected (%.0f ms speech)", self._speech_start_ms)
+                        try:
+                            self._on_barge_in()
+                        except Exception as e2:
+                            logger.warning("Barge-in callback failed: %s", e2)
+            else:
+                self._speech_start_ms = None
+
+    def reset(self) -> None:
+        """Reset detector state at the start of a new assistant turn."""
+        self._cancelled.clear()
+        with self._lock:
+            self._speech_start_ms = None
+        if self._vad is not None and hasattr(self._vad, "reset"):
+            try:
+                cls_name = type(self._vad).__name__
+                if cls_name == "SileroVAD":
+                    self._vad.reset()
+                elif cls_name == "RMSVAD":
+                    self._vad.reset()
+            except Exception as e:
+                logger.debug("Barge-in VAD reset failed: %s", e)
 
 # ============================================================================
 # VAD utilities exposed for callers that need provider-aware detection

@@ -259,6 +259,11 @@ class SileroVAD:
     def model_path(self) -> str:
         return self._model_path
 
+    @property
+    def has_speech(self) -> bool:
+        """True once speech has been confirmed for the current utterance."""
+        return self._has_speech
+
     def _ensure_session(self) -> None:
         """Create the ONNX InferenceSession on first use."""
         if self._session is not None:
@@ -410,6 +415,11 @@ class RMSVAD:
         self._resume_start: float = 0.0
         self._resume_dip_start: float = 0.0
         self._start_time: float = 0.0
+
+    @property
+    def has_speech(self) -> bool:
+        """True once speech has been confirmed for the current utterance."""
+        return self._has_spoken
 
     def reset(self, start_time: Optional[float] = None) -> None:
         """Reset all tracking state for a new utterance."""
