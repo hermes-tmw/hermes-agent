@@ -359,6 +359,88 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_active_pr_ignores_other_author(kanban_home, monkeypatch):
+    """Guard #4 must only fire for PR comments by the task's own assignee.
+
+    Regression: cody posted PR-URL comments on Percy's review card, so the
+    ``active_pr`` guard held a card Percy had never run on. A first-time review
+    by a different assignee must not be deferred.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+
+    with kb.connect() as conn:
+        # Case 1: assignee Percy, PR comment by cody → must spawn (no guard).
+        tid_percy = kb.create_task(conn, title="review percy", assignee="percy")
+        kb.add_comment(
+            conn,
+            tid_percy,
+            "cody",
+            "PR opened by cody: https://github.com/stewrd-inc/agentc/pull/79730",
+        )
+        kb.add_comment(
+            conn,
+            tid_percy,
+            "cody",
+            "Follow-up note without a URL",
+        )
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        assert kb.check_respawn_guard(conn, tid_percy) is None
+
+        # Case 2: assignee cody, PR comment by cody → still guarded.
+        tid_cody = kb.create_task(conn, title="ship cody", assignee="cody")
+        kb.add_comment(
+            conn,
+            tid_cody,
+            "cody",
+            "PR: https://github.com/stewrd-inc/agentc/pull/79730",
+        )
+        assert kb.check_respawn_guard(conn, tid_cody) == "active_pr"
+
+        # Case 3: same-author check is case-insensitive.
+        tid_case = kb.create_task(conn, title="ship Cody", assignee="Cody")
+        kb.add_comment(
+            conn,
+            tid_case,
+            "CODY",
+            "https://github.com/stewrd-inc/agentc/pull/1",
+        )
+        assert kb.check_respawn_guard(conn, tid_case) == "active_pr"
+
+        # Case 4: stale comment outside the PR window is ignored regardless.
+        tid_stale = kb.create_task(conn, title="stale", assignee="cody")
+        kb.add_comment(
+            conn,
+            tid_stale,
+            "cody",
+            "https://github.com/stewrd-inc/agentc/pull/1",
+        )
+        monkeypatch.setattr(_kb.time, "time", lambda: now + _kb._RESPAWN_GUARD_PR_WINDOW + 1)
+        assert kb.check_respawn_guard(conn, tid_stale) is None
+
+
+def test_respawn_guard_active_pr_allows_first_spawn(kanban_home, monkeypatch):
+    """A card with no prior runs and only a PR comment by another worker must
+    never be held by the active_pr guard."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="first review", assignee="percy")
+        kb.add_comment(
+            conn,
+            tid,
+            "cody",
+            "PR for review: https://github.com/stewrd-inc/agentc/pull/79730",
+        )
+        # Confirm there are no task_runs.
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 
 
 
