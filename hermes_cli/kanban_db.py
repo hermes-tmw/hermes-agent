@@ -8235,8 +8235,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) *and* the comment was authored
+        by the task's assignee.  A prior worker already opened a PR for this
+        task; re-spawning risks a duplicate PR.  PR URLs from other workers
+        (e.g. a parent handoff with a review card assigned to someone else)
+        are ignored, so first-time reviews by a different assignee are not
+        blocked.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8244,12 +8248,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT assignee, last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
 
+    assignee = _canonical_assignee(row["assignee"])
     now = int(time.time())
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
@@ -8319,13 +8324,24 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Scope to the *assignee's own* PR URL so a review card handed to a
+    #    different worker isn't held by the original PR author's handoff
+    #    comment.  First-time spawns (no runs at all) must never be held
+    #    here either.
+    has_any_run = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+    ).fetchone()
+    if has_any_run is None:
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            if _canonical_assignee(c["author"]) == assignee:
+                return "active_pr"
 
     return None
 

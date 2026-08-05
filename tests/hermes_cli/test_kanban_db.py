@@ -359,10 +359,73 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_active_pr_requires_assignee_author_and_prior_run(
+    kanban_home, monkeypatch,
+):
+    """The ``active_pr`` guard only blocks a re-spawn when the PR URL was
+    posted by the task's own assignee AND the task has been run before.
+    A first-time review by a different assignee must not be held.
+    """
+    import hermes_cli.kanban_db as _kb
 
+    now = 10_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+    pr_url = "https://github.com/stewrd-inc/agentc/pull/79730"
 
+    with kb.connect() as conn:
+        # Cody's task, completed, PR URL comment by cody -> guard holds cody.
+        author = kb.create_task(conn, title="author task", assignee="cody")
+        kb.add_comment(conn, author, "cody", f"PR open: {pr_url}")
+        # Give it a prior run so the guard can fire.  Because a completed
+        # run within the success window would trip the ``recent_success``
+        # guard first, move the run's ended_at outside that window.
+        kb.claim_task(conn, author)
+        run_ended = now - _kb._RESPAWN_GUARD_SUCCESS_WINDOW - 1
+        author_task = kb.get_task(conn, author)
+        assert author_task is not None
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='done', "
+            "summary='done', ended_at=? WHERE id=?",
+            (run_ended, author_task.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?",
+            (author,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, author) == "active_pr"
 
+        # Review task assigned to percy, same PR URL commented by cody -> no guard.
+        reviewer = kb.create_task(conn, title="review task", assignee="percy")
+        kb.add_comment(conn, reviewer, "cody", f"Please review {pr_url}")
+        conn.commit()
+        assert kb.check_respawn_guard(conn, reviewer) is None
 
+        # First-time spawn for the author: no runs at all -> no guard.
+        first_spawn = kb.create_task(conn, title="first spawn", assignee="cody")
+        kb.add_comment(conn, first_spawn, "cody", pr_url)
+        conn.commit()
+        assert kb.check_respawn_guard(conn, first_spawn) is None
+
+        self_hold = kb.create_task(conn, title="self hold", assignee="percy")
+        kb.add_comment(conn, self_hold, "percy", pr_url)
+        kb.claim_task(conn, self_hold)
+        self_run_ended = now - _kb._RESPAWN_GUARD_SUCCESS_WINDOW - 1
+        self_hold_task = kb.get_task(conn, self_hold)
+        assert self_hold_task is not None
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='done', "
+            "summary='done', ended_at=? WHERE id=?",
+            (self_run_ended, self_hold_task.current_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, current_run_id=NULL WHERE id=?",
+            (self_hold,),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, self_hold) == "active_pr"
 
 
 # ---------------------------------------------------------------------------
