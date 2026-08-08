@@ -37,6 +37,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.config import _coerce_bool, _coerce_float, _coerce_int
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -282,6 +283,13 @@ _SLACK_PROXY_HOSTS = (
 )
 
 
+# Prolonged Socket Mode disconnect escalation thresholds.
+# Defaults are overridden by config.yaml keys bridged in _apply_yaml_config.
+_SLACK_PROLONGED_DISCONNECT_WARNING_ATTEMPTS: int = 6
+_SLACK_PROLONGED_DISCONNECT_THRESHOLD_S: float = 300.0  # 5 minutes
+_SLACK_AUTO_RESTART_THRESHOLD_S: float = 900.0  # 15 minutes
+
+
 def _resolve_slack_proxy_url() -> Optional[str]:
     """Resolve a proxy URL that Slack SDK clients can safely use."""
     proxy_url = resolve_proxy_url()
@@ -473,6 +481,25 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Prolonged disconnect escalation state. First-failure timestamp and
+        # consecutive reconnect-failure counter, plus sentinels to fire the
+        # escalation / restart actions exactly once per outage.
+        self._socket_first_failure_at: Optional[float] = None
+        self._socket_consecutive_failures: int = 0
+        self._socket_escalation_fired: bool = False
+        # NOTE: We deliberately do NOT auto-restart the gateway from inside the
+        # Slack adapter. Restarting the whole gateway tears down every other
+        # channel (Signal, email, Telegram, cron, etc.) for a Slack-only
+        # problem, and it cannot fix a Slack-side outage — it just loops.
+        # Kept as an always-false toggle so the config key still parses but
+        # the dangerous path is dead code by construction.
+        self._auto_restart_on_prolonged_disconnect: bool = False
+        # Configurable thresholds / command, read from config.yaml via the
+        # _apply_yaml_config bridge below. Defaults mirror the constants above.
+        self._prolonged_disconnect_warning_attempts: int = _SLACK_PROLONGED_DISCONNECT_WARNING_ATTEMPTS
+        self._prolonged_disconnect_threshold_s: float = _SLACK_PROLONGED_DISCONNECT_THRESHOLD_S
+        self._auto_restart_threshold_s: float = _SLACK_AUTO_RESTART_THRESHOLD_S
+        self._prolonged_disconnect_escalation_command: str = ""
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -537,8 +564,34 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return None
 
+    def _reset_socket_failure_tracking(self, *, reason: str = "reconnect success") -> None:
+        """Reset prolonged-disconnect counters after a healthy reconnect."""
+        if self._socket_consecutive_failures:
+            logger.info(
+                "[Slack] Socket Mode recovered after %d failure(s) (%s); resetting outage state",
+                self._socket_consecutive_failures,
+                reason,
+            )
+        self._socket_first_failure_at = None
+        self._socket_consecutive_failures = 0
+        self._socket_escalation_fired = False
+        self._socket_restart_fired = False
+
+    def _mark_socket_reconnect_failure(self) -> float:
+        """Increment failure counter and capture first-failure timestamp."""
+        now = time.monotonic()
+        if self._socket_first_failure_at is None:
+            self._socket_first_failure_at = now
+        self._socket_consecutive_failures += 1
+        return now
+
     async def _restart_socket_mode(self, reason: str) -> None:
-        """Reconnect Socket Mode without rebuilding adapter state."""
+        """Reconnect Socket Mode without rebuilding adapter state.
+
+        Tracks consecutive failures and escalates when Socket Mode stays
+        disconnected for a configured threshold. Successful reconnect resets
+        the outage state.
+        """
         if not self._running:
             return
 
@@ -546,15 +599,95 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
-            logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            now = self._mark_socket_reconnect_failure()
+            elapsed = now - (self._socket_first_failure_at or now)
+            attempt = self._socket_consecutive_failures
+
+            # Structured warning once we cross the short-term threshold.
+            if attempt == self._prolonged_disconnect_warning_attempts:
+                logger.warning(
+                    "[Slack] Socket Mode unhealthy (%s); reconnecting "
+                    "(attempt=%d, elapsed=%.1fs)",
+                    reason, attempt, elapsed,
+                )
+            else:
+                logger.warning(
+                    "[Slack] Socket Mode unhealthy (%s); reconnecting", reason
+                )
+
             await self._stop_socket_mode_handler()
 
             try:
                 self._start_socket_mode_handler()
+                # If the handler starts synchronously the transport may still be
+                # connecting; reset the failure state when the watchdog observes
+                # a live connection rather than immediately here. But for the
+                # success-path bookkeeping we clear the counter now so a single
+                # successful synchronous start is honored.
+                self._reset_socket_failure_tracking(reason="reconnect succeeded")
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
                 )
+                await self._maybe_escalate_socket_outage(reason, now)
+
+    async def _maybe_escalate_socket_outage(self, reason: str, now: float) -> None:
+        """Fire escalation actions when continuous failure thresholds are crossed."""
+        if self._socket_first_failure_at is None:
+            return
+        elapsed = now - self._socket_first_failure_at
+        attempt = self._socket_consecutive_failures
+
+        # 5-minute threshold: ERROR log + optional escalation shell command.
+        if not self._socket_escalation_fired and elapsed >= self._prolonged_disconnect_threshold_s:
+            self._socket_escalation_fired = True
+            logger.error(
+                "[Slack] Prolonged Socket Mode disconnect detected "
+                "(attempt=%d, elapsed=%.1fs, reason=%s). Escalating.",
+                attempt, elapsed, reason,
+            )
+            await self._run_prolonged_disconnect_escalation_command()
+
+        # NOTE: Auto-restart via os._exit(1) is intentionally disabled.
+        # The config key still parses (default false) for backward compatibility,
+        # but the adapter never exits the gateway. See __init__ comment for why.
+
+    async def _run_prolonged_disconnect_escalation_command(self) -> None:
+        """Run the configured escalation shell command, if any.
+
+        This is intentionally async and best-effort: a slow or failing alert
+        command must not block the reconnect loop.
+        """
+        command = (self._prolonged_disconnect_escalation_command or "").strip()
+        if not command:
+            return
+        logger.info("[Slack] Running prolonged-disconnect escalation command")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=30.0
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    "[Slack] Escalation command exited %d: stderr=%s",
+                    proc.returncode,
+                    stderr.decode("utf-8", errors="replace")[:200],
+                )
+            else:
+                logger.info(
+                    "[Slack] Escalation command completed (stdout=%s)",
+                    stdout.decode("utf-8", errors="replace")[:200],
+                )
+        except asyncio.TimeoutError:
+            logger.warning("[Slack] Escalation command timed out after 30s")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning(
+                "[Slack] Escalation command failed: %s", exc, exc_info=True
+            )
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -581,6 +714,8 @@ class SlackAdapter(BasePlatformAdapter):
                 connected = await self._socket_transport_connected()
                 if connected is False:
                     await self._restart_socket_mode("transport disconnected")
+                elif connected is True and self._socket_consecutive_failures:
+                    self._reset_socket_failure_tracking(reason="transport connected")
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -917,6 +1052,28 @@ class SlackAdapter(BasePlatformAdapter):
             self._app = None
             self._app_token = app_token
             self._proxy_url = proxy_url
+
+            # Apply prolonged-disconnect escalation config from YAML-bridged
+            # env vars (or fall back to module defaults). Must happen before
+            # the watchdog starts so the first failure uses the right thresholds.
+            self._prolonged_disconnect_warning_attempts = _coerce_int(
+                os.getenv("SLACK_PROLONGED_DISCONNECT_WARNING_ATTEMPTS"),
+                _SLACK_PROLONGED_DISCONNECT_WARNING_ATTEMPTS,
+            )
+            self._prolonged_disconnect_threshold_s = _coerce_float(
+                os.getenv("SLACK_PROLONGED_DISCONNECT_THRESHOLD_SECONDS"),
+                _SLACK_PROLONGED_DISCONNECT_THRESHOLD_S,
+            )
+            self._auto_restart_threshold_s = _coerce_float(
+                os.getenv("SLACK_AUTO_RESTART_THRESHOLD_SECONDS"),
+                _SLACK_AUTO_RESTART_THRESHOLD_S,
+            )
+            # Auto-restart is disabled by design; the config key is still
+            # parsed so existing config.yaml files don't raise errors.
+            self._auto_restart_on_prolonged_disconnect = False
+            self._prolonged_disconnect_escalation_command = str(
+                os.getenv("SLACK_PROLONGED_DISCONNECT_ESCALATION_COMMAND") or ""
+            )
 
             # Reset multi-workspace state before re-populating it so a
             # reconnect that drops a workspace (or rotates the primary bot
@@ -4235,6 +4392,23 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+
+    # Prolonged disconnect escalation settings. We keep the env-bridge idiom
+    # used elsewhere in this function so existing runtime code can read either
+    # YAML (via the bridge) or explicit env vars. Defaults mirror the module
+    # constants and preserve backward compatibility.
+    arpd = slack_cfg.get("auto_restart_on_prolonged_disconnect")
+    if arpd is not None and not os.getenv("SLACK_AUTO_RESTART_ON_PROLONGED_DISCONNECT"):
+        os.environ["SLACK_AUTO_RESTART_ON_PROLONGED_DISCONNECT"] = str(bool(arpd)).lower()
+    pdt = slack_cfg.get("prolonged_disconnect_threshold_seconds")
+    if pdt is not None and not os.getenv("SLACK_PROLONGED_DISCONNECT_THRESHOLD_SECONDS"):
+        os.environ["SLACK_PROLONGED_DISCONNECT_THRESHOLD_SECONDS"] = str(float(pdt))
+    art = slack_cfg.get("auto_restart_threshold_seconds")
+    if art is not None and not os.getenv("SLACK_AUTO_RESTART_THRESHOLD_SECONDS"):
+        os.environ["SLACK_AUTO_RESTART_THRESHOLD_SECONDS"] = str(float(art))
+    esc = slack_cfg.get("escalation_command")
+    if esc is not None and not os.getenv("SLACK_PROLONGED_DISCONNECT_ESCALATION_COMMAND"):
+        os.environ["SLACK_PROLONGED_DISCONNECT_ESCALATION_COMMAND"] = str(esc)
     return None  # all settings flow through env; nothing to merge into extras
 
 
