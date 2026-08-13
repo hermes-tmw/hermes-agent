@@ -14,12 +14,13 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -422,6 +423,77 @@ class MattermostAdapter(BasePlatformAdapter):
         ch_type = _CHANNEL_TYPE_MAP.get(data.get("type", "O"), "channel")
         display_name = data.get("display_name") or data.get("name") or chat_id
         return {"name": display_name, "type": ch_type}
+
+    async def fetch_channel_history(
+        self,
+        channel_id: str,
+        *,
+        before_ts: Optional[Union[int, float, str]] = None,
+        since_ts: Optional[Union[int, float, str]] = None,
+        limit: int = 200,
+    ) -> str:
+        """Fetch and format channel history on demand.
+
+        Wraps ``GET /api/v4/channels/{channel_id}/posts``. Returns a human-readable
+        string of prior posts, optionally filtered by timestamp. The result is safe
+        for injection into an agent turn as background context.
+
+        This method is intentionally NOT called automatically on channel join;
+        it exists only for explicit on-request backfill.
+
+        Args:
+            channel_id: Mattermost channel ID.
+            before_ts: Include posts created strictly before this timestamp.
+                       Accepts epoch millis, ISO-8601 string, or
+                       Mattermost's ``create_at`` millis format.
+            since_ts: Include posts created at or after this timestamp.
+            limit: Maximum posts to fetch (default 200, capped at 200).
+
+        Returns:
+            Formatted history string, or an error dict JSON string on failure.
+        """
+        if not channel_id:
+            return json.dumps({"error": "channel_id is required"})
+
+        try:
+            limit = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            limit = 200
+
+        # Build query params. Mattermost uses "since" (epoch ms), "before" and
+        # "after" (post IDs). We only have a reliable timestamp gate, so we
+        # fetch the requested window and filter client-side. This avoids the
+        # need for callers to supply post IDs.
+        params: List[str] = [f"per_page={limit}"]
+        since_ms = _parse_mm_ts(since_ts)
+        before_ms = _parse_mm_ts(before_ts)
+
+        path = f"channels/{channel_id}/posts?{ '&'.join(params) }"
+        data = await self._api_get(path)
+        if not data:
+            return json.dumps({"error": f"Failed to fetch history for channel {channel_id}"})
+
+        posts = data.get("posts")
+        order = data.get("order", [])
+        if not isinstance(posts, dict) or not order:
+            return "No history found."
+
+        # Posts keyed by ID; order is newest-first. Reverse to chronological.
+        filtered: List[Dict[str, Any]] = []
+        for post_id in reversed(order):
+            post = posts.get(post_id)
+            if not isinstance(post, dict):
+                continue
+            created_at = post.get("create_at")
+            if not isinstance(created_at, (int, float)):
+                continue
+            if since_ms is not None and created_at < since_ms:
+                continue
+            if before_ms is not None and created_at >= before_ms:
+                continue
+            filtered.append(post)
+
+        return _format_channel_history(filtered, channel_id=channel_id)
 
     # ------------------------------------------------------------------
     # Optional overrides
@@ -1253,6 +1325,103 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
             ac = ",".join(str(v) for v in ac)
         os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
     return None  # all settings flow through env; nothing to merge into extras
+
+
+# ---------------------------------------------------------------------------
+# Channel-history helpers (on-request backfill only)
+# ---------------------------------------------------------------------------
+
+
+def _parse_mm_ts(ts: Optional[Union[int, float, str]]) -> Optional[int]:
+    """Normalize a timestamp argument to Mattermost epoch milliseconds.
+
+    Accepts:
+      - int/float epoch milliseconds (Mattermost's native ``create_at``)
+      - ISO-8601 strings (e.g. "2026-08-06T12:00:00Z" or with offset)
+      - Human-friendly date strings YYYY-MM-DD (interpreted as UTC midnight)
+
+    Returns None for empty/invalid input.
+    """
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, (int, float)):
+        return int(ts)
+
+    s = str(ts).strip()
+    if not s:
+        return None
+
+    # Already a numeric string?
+    if s.isdigit():
+        return int(s)
+
+    # ISO-8601 with optional offset or 'Z'.
+    try:
+        if "T" in s:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = datetime.datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return int(parsed.timestamp() * 1000)
+    except Exception:
+        pass
+
+    # YYYY-MM-DD (UTC midnight).
+    try:
+        parsed = datetime.datetime.strptime(s, "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone.utc
+        )
+        return int(parsed.timestamp() * 1000)
+    except ValueError:
+        pass
+
+    return None
+
+
+def _format_channel_history(
+    posts: List[Dict[str, Any]], *, channel_id: str
+) -> str:
+    """Format Mattermost posts into a human-readable history block.
+
+    Output is one line per post: ``[timestamp] name: message``. System posts
+    are preserved because they carry meaningful channel events (e.g. "user
+    joined"). Untrusted display names and message text are collapsed to a
+    single line each so embedded newlines cannot break out of the format.
+    """
+    if not posts:
+        return "No history found."
+
+    from gateway.session import neutralize_untrusted_inline_text
+
+    lines: List[str] = []
+    for post in posts:
+        user_id = post.get("user_id", "")
+        username = post.get("username") or post.get("sender_name", "") or user_id
+        message = post.get("message", "")
+        created_at = post.get("create_at")
+
+        ts_str = ""
+        if isinstance(created_at, (int, float)):
+            try:
+                ts_dt = datetime.datetime.fromtimestamp(
+                    created_at / 1000.0, tz=datetime.timezone.utc
+                )
+                ts_str = ts_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            except Exception:
+                ts_str = str(created_at)
+
+        type_label = ""
+        if post.get("type"):
+            # e.g. "system_join_channel" -> "[system] "
+            type_label = "[system] "
+
+        safe_name = neutralize_untrusted_inline_text(username)
+        safe_text = neutralize_untrusted_inline_text(message, max_chars=0)
+        lines.append(f"[{ts_str}] {type_label}{safe_name}: {safe_text}")
+
+    header = f"[Channel history for {channel_id}]"
+    return "\n".join([header] + lines + ["[End of channel history]"])
 
 
 # ---------------------------------------------------------------------------
