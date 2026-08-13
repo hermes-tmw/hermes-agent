@@ -89,9 +89,13 @@ def _get_live_adapter() -> Optional[Any]:
 
 def _handle_mattermost_channel_history(args: Dict[str, Any], **kw) -> str:
     """Sync handler bridge to the async adapter method."""
-    channel_id = (args.get("channel_id") or "").strip()
+    channel_id = str(args.get("channel_id") or "").strip()
     if not channel_id:
         return tool_error("channel_id is required")
+    # Defense-in-depth: validate channel_id format before touching the adapter.
+    from plugins.platforms.mattermost.adapter import _is_valid_mm_channel_id
+    if not _is_valid_mm_channel_id(channel_id):
+        return tool_error(f"Invalid Mattermost channel_id: {channel_id}")
 
     adapter = _get_live_adapter()
     if adapter is None:

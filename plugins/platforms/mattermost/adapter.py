@@ -24,6 +24,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+
+# Strict validation for Mattermost channel IDs: 26-character lowercase alphanumeric.
+_CHANNEL_ID_RE = re.compile(r"^[a-z0-9]{26}$")
+
+
+def _is_valid_mm_channel_id(channel_id: str) -> bool:
+    """Return True only for well-formed Mattermost channel IDs."""
+    return isinstance(channel_id, str) and bool(_CHANNEL_ID_RE.fullmatch(channel_id))
+
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -452,8 +461,27 @@ class MattermostAdapter(BasePlatformAdapter):
         Returns:
             Formatted history string, or an error dict JSON string on failure.
         """
+        channel_id = str(channel_id or "").strip()
         if not channel_id:
             return json.dumps({"error": "channel_id is required"})
+        if not _is_valid_mm_channel_id(channel_id):
+            logger.warning("Mattermost history: invalid channel_id %r", channel_id)
+            return json.dumps({"error": f"Invalid Mattermost channel_id: {channel_id}"})
+
+        # Authorization: respect allowed_channels whitelist if configured.
+        allowed_raw = self.config.extra.get("allowed_channels") if self.config.extra else None
+        if allowed_raw is None:
+            allowed_raw = os.getenv("MATTERMOST_ALLOWED_CHANNELS", "")
+        if isinstance(allowed_raw, list):
+            allowed_channels = {str(c).strip() for c in allowed_raw if str(c).strip()}
+        else:
+            allowed_channels = {c.strip() for c in str(allowed_raw).split(",") if c.strip()}
+        if allowed_channels and channel_id not in allowed_channels:
+            logger.warning(
+                "Mattermost history: channel %s not in allowed_channels whitelist",
+                channel_id,
+            )
+            return json.dumps({"error": f"Channel {channel_id} is not in the allowed_channels whitelist"})
 
         try:
             limit = max(1, min(int(limit), 200))
@@ -1416,8 +1444,8 @@ def _format_channel_history(
             # e.g. "system_join_channel" -> "[system] "
             type_label = "[system] "
 
-        safe_name = neutralize_untrusted_inline_text(username)
-        safe_text = neutralize_untrusted_inline_text(message, max_chars=0)
+        safe_name = neutralize_untrusted_inline_text(username, max_chars=80)
+        safe_text = neutralize_untrusted_inline_text(message, max_chars=240)
         lines.append(f"[{ts_str}] {type_label}{safe_name}: {safe_text}")
 
     header = f"[Channel history for {channel_id}]"
