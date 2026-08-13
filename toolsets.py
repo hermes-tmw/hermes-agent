@@ -555,10 +555,17 @@ TOOLSETS = {
 
     "hermes-mattermost": {
         "description": "Mattermost bot toolset - self-hosted team messaging (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + [
+            "mattermost_channel_history",
+        ],
         "includes": []
     },
 
+    "mattermost_history": {
+        "description": "Mattermost on-request channel-history backfill",
+        "tools": ["mattermost_channel_history"],
+        "includes": []
+    },
     "hermes-matrix": {
         "description": "Matrix bot toolset - decentralized encrypted messaging (full access)",
         "tools": _HERMES_CORE_TOOLS,
