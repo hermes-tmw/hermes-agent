@@ -607,6 +607,263 @@ def test_voice_record_stop_updates_event_session_id(monkeypatch):
     assert server._voice_event_sid == "new-session"
 
 
+def _voice_chat_session_fixture(monkeypatch, *, running=False):
+    """Install a minimal live session + patched prompt.submit pipeline.
+
+    Returns (submitted, captured, turn_ran, session). ``captured`` fills with
+    the arguments the seam passed into the post-agent-build step
+    (``_run_prompt_submit``). ``_run_prompt_submit`` is replaced with a
+    capture hook so the test never builds a real agent; everything up to
+    that seam (session lookup, busy/queue policy, running-flag, threading
+    contract) still runs the production code path.
+    """
+    submitted: dict = {}
+    captured: dict = {}
+    turn_ran = threading.Event()
+
+    session = _session(transport=None, running=running)
+    server._sessions["voice-sid"] = session
+    monkeypatch.setattr(server, "_voice_event_sid", "voice-sid")
+    monkeypatch.setattr(server, "_start_agent_build", lambda s, sess: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda sess, rid, timeout=30.0: None)
+
+    def fake_run(rid, sid, sess, text):
+        captured["rid"] = rid
+        captured["sid"] = sid
+        captured["text"] = text
+        turn_ran.set()
+
+    def fake_busy(rid, sid, sess, text, transport):
+        submitted["busy_submit_text"] = text
+        return {"jsonrpc": "2.0", "id": rid, "result": {"status": "queued"}}
+
+    monkeypatch.setattr(server, "_run_prompt_submit", fake_run)
+    monkeypatch.setattr(server, "_handle_busy_submit", fake_busy)
+    return submitted, captured, turn_ran, session
+
+
+def test_voice_transcript_handler_toggle_off_only_emits(monkeypatch):
+    """voice.chat unset / false: today's transcript-only behaviour, no submit.
+
+    Regression anchor for the P1a seam — with the toggle off the handler must
+    reduce to the pre-change ``lambda t: _voice_emit(...)`` behaviour so the
+    existing push-to-talk / transcript-only flow is untouched.
+    """
+    emitted: list = []
+    monkeypatch.setattr(server, "_voice_emit", lambda event, payload=None: emitted.append((event, payload)))
+    monkeypatch.setattr(server, "_voice_chat_submit_transcript", lambda text: emitted.append(("SUBMIT", {"text": text})))
+
+    # No 'chat' key at all — config default.
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
+    server._voice_transcript_handler("hello world")
+    assert emitted == [("voice.transcript", {"text": "hello world"})]
+
+    # Explicit false — the documented default.
+    emitted.clear()
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": False}})
+    server._voice_transcript_handler("hello world")
+    assert emitted == [("voice.transcript", {"text": "hello world"})]
+
+    # Shape-unsafe values from a hand-edited config.yaml all read as OFF.
+    for bad in (42, ["true"], None, {"on": "yes"}, ""):
+        emitted.clear()
+        monkeypatch.setattr(server, "_load_cfg", lambda b=bad: {"voice": {"chat": b}})
+        server._voice_transcript_handler("hello world")
+        assert emitted == [("voice.transcript", {"text": "hello world"})], f"chat={bad!r}"
+
+
+def test_voice_chat_enabled_shape_safety(monkeypatch):
+    """Config shape guard: only an explicit true / truthy string enables chat.
+
+    Keeps a malformed hand-edit (``chat: 1`` the int, ``chat: {on: yes}``
+    the mapping) from turning the feature on by accident — the seam mutates
+    the *session*, so the toggle must be deliberate.
+    """
+    assert server._voice_chat_enabled() is False  # no cfg loaded at all
+
+    for on_cfg in ({"voice": {"chat": True}}, {"voice": {"chat": "true"}},
+                  {"voice": {"chat": "on"}}, {"voice": {"chat": "yes"}},
+                  {"voice": {"chat": "1"}}, {"voice": {"chat": "TRUE"}}):
+        monkeypatch.setattr(server, "_load_cfg", lambda c=on_cfg: c)
+        assert server._voice_chat_enabled() is True, on_cfg
+
+    for off_cfg in ({"voice": {"chat": False}}, {"voice": {"chat": 1}},
+                   {"voice": {"chat": "false"}}, {"voice": {"chat": ["true"]}},
+                   {"voice": {"chat": None}}, {"voice": {}}):
+        monkeypatch.setattr(server, "_load_cfg", lambda c=off_cfg: c)
+        assert server._voice_chat_enabled() is False, off_cfg
+
+
+def test_voice_transcript_handler_toggle_on_auto_submits(monkeypatch):
+    """voice.chat: true — transcript auto-submits as session's next agent turn.
+
+    E2E along the real seam: the handler emits the ``voice.transcript`` event
+    AS TODAY (so the client still gets its echo), then routes the same text
+    through the production ``prompt.submit`` dispatch. ``_run_prompt_submit``
+    is the capture point — it's the function a typed prompt lands on after
+    the agent-build path, so asserting it fired with the transcript text
+    verifies the voice turn reached the agent ingest seam.
+    """
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    _submitted, captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch)
+    emitted: list = []
+    monkeypatch.setattr(server, "_voice_emit", lambda event, payload=None: emitted.append((event, payload)))
+
+    try:
+        server._voice_transcript_handler("  what's on the calendar?  ")
+        assert turn_ran.wait(timeout=5.0), "agent turn never ran"
+        assert captured["sid"] == "voice-sid"
+        assert captured["text"] == "what's on the calendar?"
+        # Event echo still fires BEFORE the submit (client UX unchanged).
+        assert emitted[0] == ("voice.transcript", {"text": "  what's on the calendar?  "})
+        # The seam marks the session running (typed-prompt contract).
+        assert session["running"] is True
+        assert session["inflight_turn"]["user"] == "what's on the calendar?"
+    finally:
+        session["running"] = False
+        server._sessions.pop("voice-sid", None)
+
+
+def test_voice_chat_submit_whitespace_only_skips(monkeypatch):
+    """Empty / whitespace transcripts never produce an agent turn.
+
+    The VAD loop can trip on noise; routing a blank string into the session
+    would fabricate an empty user message, so the seam rejects before
+    dispatching.
+    """
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    _submitted, captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch)
+
+    try:
+        server._voice_chat_submit_transcript("   ")
+        server._voice_chat_submit_transcript("\n\t ")
+        assert not turn_ran.is_set()
+        assert "text" not in captured
+    finally:
+        server._sessions.pop("voice-sid", None)
+
+
+def test_voice_chat_submit_no_session_bound_skips(monkeypatch, capsys):
+    """Transcript with no bound session: stderr note + no dispatch, no crash.
+
+    A transcript arriving before any voice.record start (or after session
+    teardown) must be a loud no-op — silent failure would look like the
+    agent ignored the user.
+    """
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    monkeypatch.setattr(server, "_voice_event_sid", "")
+    dispatched: list = []
+    monkeypatch.setattr(server, "handle_request", lambda req: dispatched.append(req) or {})
+
+    server._voice_chat_submit_transcript("hello")
+    captured = capsys.readouterr()
+    assert "no bound session" in captured.err
+    assert dispatched == []
+
+
+def test_voice_chat_submit_session_gone_skips(monkeypatch, capsys):
+    """Session evicted between start and transcript: drop loudly, no crash."""
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    monkeypatch.setattr(server, "_voice_event_sid", "voice-sid")
+    server._sessions.pop("voice-sid", None)
+
+    server._voice_chat_submit_transcript("hello")
+    captured = capsys.readouterr()
+    assert "not found" in captured.err
+
+
+def test_voice_chat_client_direct_no_double_send(monkeypatch):
+    """client_direct guard: the seam is the ONLY submitter of a voice transcript.
+
+    When ``voice.chat`` is on the client must NOT also forward the same text
+    as its own ``prompt.submit`` — submission ownership moved server-side.
+    The assertable invariant on this side of the process boundary is the
+    one the client relies on: exactly ONE dispatch per transcript, carrying
+    the transcript text and only the transcript text.
+    """
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    dispatched: list = []
+    real_handle = server.handle_request
+
+    def track_handle(req):
+        if isinstance(req, dict) and req.get("method") == "prompt.submit":
+            dispatched.append(req)
+        return real_handle(req)
+
+    monkeypatch.setattr(server, "handle_request", track_handle)
+    _submitted, captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch)
+
+    try:
+        server._voice_transcript_handler("one shot")
+        assert turn_ran.wait(timeout=5.0)
+        assert len(dispatched) == 1, "expected exactly one prompt.submit dispatch"
+        req = dispatched[0]
+        assert req["params"] == {"session_id": "voice-sid", "text": "one shot"}
+        # The seam tags its dispatch ids so a log/trace can distinguish a
+        # voice-originated turn from a typed one.
+        assert req["id"].startswith("voice-chat-")
+    finally:
+        session["running"] = False
+        server._sessions.pop("voice-sid", None)
+
+
+def test_voice_chat_submit_when_session_busy_queues(monkeypatch):
+    """A transcript arriving mid-turn goes through the existing busy policy.
+
+    Rather than a bespoke voice-mode path, the seam funnels into the same
+    ``_handle_busy_submit`` queue/interrupt semantics a typed prompt sees,
+    so an in-flight agent turn handles the voice turn exactly as if Tom had
+    typed it while a reply was generating.
+    """
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    submitted, _captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch, running=True)
+
+    try:
+        server._voice_chat_submit_transcript("follow-up from voice")
+        assert submitted["busy_submit_text"] == "follow-up from voice"
+        # Busy policy queued it for the next turn — the seam didn't run it inline.
+        assert not turn_ran.is_set()
+    finally:
+        server._sessions.pop("voice-sid", None)
+
+
+def test_voice_record_start_wires_seam_handler(monkeypatch):
+    """voice.record start passes the seam-aware handler into the VAD loop.
+
+    Locks the wiring: if the seam handler were swapped back to the bare
+    ``lambda t: _voice_emit(...)``, this test catches it by asserting the
+    callback identity — no other call site should be passing a different
+    on_transcript.
+    """
+    captured: dict = {}
+
+    def fake_start_continuous(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=fake_start_continuous, stop_continuous=lambda: None
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {}})
+
+    resp = server.dispatch(
+        {
+            "id": "voice-record",
+            "method": "voice.record",
+            "params": {"action": "start"},
+        }
+    )
+
+    assert resp["result"]["status"] == "recording"
+    assert captured["on_transcript"] is server._voice_transcript_handler
+
+
 def test_voice_record_start_reports_busy_when_stop_is_in_progress(monkeypatch):
     monkeypatch.setitem(
         sys.modules,

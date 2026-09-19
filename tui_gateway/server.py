@@ -12421,6 +12421,112 @@ def _voice_record_key() -> str:
 
     return str(record_key) if isinstance(record_key, str) and record_key else "ctrl+b"
 
+def _voice_chat_enabled() -> bool:
+    """Whether ``voice.chat: true`` auto-submits voice transcripts as agent turns.
+
+    Default OFF = today's transcript-only behaviour preserved. Only a literal
+    ``true`` (or a recognised truthy string matching config conventions such as
+    ``"true"`` / ``"1"`` / ``"yes"``) flips it on; any other value — missing,
+    bool False, weird scalars/lists from a hand-edited config.yaml — is off
+    (the same shape-safety posture as ``_voice_cfg_dict`` / ``_voice_record_key``).
+    """
+    raw = _voice_cfg_dict().get("chat")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"true", "1", "yes", "on"}
+    return False
+
+def _voice_chat_submit_transcript(text: str) -> None:
+    """Server-side auto-submit of a voice transcript as the session's next agent turn.
+
+    Funnels the voice turn through the exact ``prompt.submit`` path a typed
+    prompt uses (queue-when-busy policy, history-lock turn state, agent build,
+    streaming, goal-hook), so ``voice.chat`` introduces no second ingest seam.
+    The dispatch response (``{"status": "streaming"}`` / ``"queued"``) is
+    process-local and intentionally discarded — there is no JSON-RPC client on
+    this path; all the client-visible stream events (``message.start`` /
+    ``message.delta`` / ``message.complete``) route through the session's own
+    transport binding.
+
+    client_direct interplay: the client MUST NOT also forward the same text as
+    its own ``prompt.submit`` when it observes its ``voice.transcript`` echo —
+    submission ownership moved server-side with this flag. The TUI client holds
+    the same config, so it suppresses its own send when ``voice.chat`` is on
+    (defence in depth: a client that forgot would surface as a queued duplicate
+    visible in the transcript, never as corrupt state — the queue is idempotent).
+
+    Errors surface to stderr + the voice event stream rather than raising:
+    the transcript itself was already emitted to the UI, so a failed submit
+    leaves a consistent (if unanswered) transcript rather than a silent turn.
+    """
+    t = (text or "").strip()
+    if not t:
+        return
+    with _voice_sid_lock:
+        sid = _voice_event_sid
+    if not sid:
+        print(
+            "[tui_gateway] voice.chat: transcript arrived with no bound session — not submitted",
+            file=sys.stderr,
+        )
+        return
+    session = _sessions.get(sid)
+    if session is None:
+        print(
+            f"[tui_gateway] voice.chat: session '{sid}' not found — transcript not submitted",
+            file=sys.stderr,
+        )
+        return
+    try:
+        resp = dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": f"voice-chat-{uuid.uuid4().hex[:12]}",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": t},
+            },
+            transport=session.get("transport"),
+        )
+        if isinstance(resp, dict) and resp.get("error"):
+            err = resp["error"]
+            print(
+                f"[tui_gateway] voice.chat: prompt.submit failed: "
+                f"code={err.get('code')} message={err.get('message')}",
+                file=sys.stderr,
+            )
+            _emit(
+                "error",
+                sid,
+                {"message": f"voice.chat submit failed: {err.get('message', 'unknown')}"},
+            )
+    except Exception as exc:
+        print(
+            f"[tui_gateway] voice.chat: dispatch raised {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        _emit("error", sid, {"message": f"voice.chat submit error: {exc}"})
+
+
+def _voice_transcript_handler(text: str) -> None:
+    """Single ``voice.transcript`` seam used by every voice loop.
+
+    Emits the event exactly as today (so /voice on, Ctrl+B record, and the
+    existing transcript-only behaviour are byte-for-byte unchanged), then —
+    when ``voice.chat: true`` — routes the same text into the session as the
+    next agent turn. With the toggle OFF this function is a pure alias of the
+    old lambda and cannot regress anything.
+    """
+    _voice_emit("voice.transcript", {"text": text})
+    if _voice_chat_enabled():
+        _voice_chat_submit_transcript(text)
+
+
+# The VAD loop invokes its callback on a background audio thread; keep a named
+# helper so tests patch one symbol and the wiring stays explicit at the seam.
+def _make_voice_transcript_handler():
+    return _voice_transcript_handler
+
 
 @method("voice.toggle")
 def _(rid, params: dict) -> dict:
@@ -12567,7 +12673,7 @@ def _(rid, params: dict) -> dict:
                 else 3.0
             )
             started = start_continuous(
-                on_transcript=lambda t: _voice_emit("voice.transcript", {"text": t}),
+                on_transcript=_make_voice_transcript_handler(),
                 on_status=lambda s: _voice_emit("voice.status", {"state": s}),
                 on_silent_limit=lambda: _voice_emit(
                     "voice.transcript", {"no_speech_limit": True}
