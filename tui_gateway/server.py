@@ -12451,16 +12451,24 @@ def _voice_chat_submit_transcript(text: str) -> None:
 
     client_direct interplay: the client MUST NOT also forward the same text as
     its own ``prompt.submit`` when it observes its ``voice.transcript`` echo —
-    submission ownership moved server-side with this flag. The TUI client holds
-    the same config, so it suppresses its own send when ``voice.chat`` is on
-    (defence in depth: a client that forgot would surface as a queued duplicate
-    visible in the transcript, never as corrupt state — the queue is idempotent).
+    submission ownership moves server-side with this flag. The seam therefore
+    tags the echo ``{"submitted": True}`` BEFORE dispatching (correct in both
+    interleavings of the echo/dispatch race), and the TUI client skips its own
+    auto-submit when that tag is present. If the tag were only added after
+    dispatch, a fast client could observe the untagged echo first and
+    double-send.
 
     Errors surface to stderr + the voice event stream rather than raising:
     the transcript itself was already emitted to the UI, so a failed submit
     leaves a consistent (if unanswered) transcript rather than a silent turn.
     """
-    t = (text or "").strip()
+    if not isinstance(text, str):
+        print(
+            f"[tui_gateway] voice.chat: non-str transcript dropped: {type(text).__name__}",
+            file=sys.stderr,
+        )
+        return
+    t = text.strip()
     if not t:
         return
     with _voice_sid_lock:
@@ -12478,11 +12486,12 @@ def _voice_chat_submit_transcript(text: str) -> None:
             file=sys.stderr,
         )
         return
+    rid = f"voice-chat-{uuid.uuid4().hex[:12]}"
     try:
         resp = dispatch(
             {
                 "jsonrpc": "2.0",
-                "id": f"voice-chat-{uuid.uuid4().hex[:12]}",
+                "id": rid,
                 "method": "prompt.submit",
                 "params": {"session_id": sid, "text": t},
             },
@@ -12491,7 +12500,7 @@ def _voice_chat_submit_transcript(text: str) -> None:
         if isinstance(resp, dict) and resp.get("error"):
             err = resp["error"]
             print(
-                f"[tui_gateway] voice.chat: prompt.submit failed: "
+                f"[tui_gateway] voice.chat: prompt.submit failed (rid={rid}): "
                 f"code={err.get('code')} message={err.get('message')}",
                 file=sys.stderr,
             )
@@ -12502,7 +12511,8 @@ def _voice_chat_submit_transcript(text: str) -> None:
             )
     except Exception as exc:
         print(
-            f"[tui_gateway] voice.chat: dispatch raised {type(exc).__name__}: {exc}",
+            f"[tui_gateway] voice.chat: dispatch raised (rid={rid}) "
+            f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         _emit("error", sid, {"message": f"voice.chat submit error: {exc}"})
@@ -12514,12 +12524,25 @@ def _voice_transcript_handler(text: str) -> None:
     Emits the event exactly as today (so /voice on, Ctrl+B record, and the
     existing transcript-only behaviour are byte-for-byte unchanged), then —
     when ``voice.chat: true`` — routes the same text into the session as the
-    next agent turn. With the toggle OFF this function is a pure alias of the
-    old lambda and cannot regress anything.
+    next agent turn. With the toggle OFF **no agent turn is dispatched
+    server-side; the TUI client still auto-submits the echo on its own**
+    (``createGatewayEventHandler.ts`` ``case 'voice.transcript'``), so
+    toggling ``voice.chat`` is about *who* submits (client vs server seam),
+    not whether a turn happens.
+
+    Toggle ON ordering: the echo carries ``submitted: true`` and is emitted
+    BEFORE dispatch so the tag is present no matter which interleaving of
+    echo-delivery vs dispatch the client observes — the client skips its own
+    auto-submit on the tag, so it can never see an untagged echo for a turn
+    the seam owns and double-send.
     """
-    _voice_emit("voice.transcript", {"text": text})
     if _voice_chat_enabled():
-        _voice_chat_submit_transcript(text)
+        _voice_emit("voice.transcript", {"text": text, "submitted": True})
+        # Pre-strip so a whitespace-only transcript tags its echo (the seam has
+        # committed to owning non-empty submissions) but still skips dispatch.
+        _voice_chat_submit_transcript(text.strip() if isinstance(text, str) else text)
+    else:
+        _voice_emit("voice.transcript", {"text": text})
 
 
 # The VAD loop invokes its callback on a background audio thread; keep a named

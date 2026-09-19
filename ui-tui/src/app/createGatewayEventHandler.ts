@@ -618,6 +618,15 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        // voice.chat seam (server): when the server owns the submit it tags
+        // the echo { submitted: true } BEFORE dispatching, so we must NOT
+        // also forward the same text — doing so double-submits and, under
+        // busy_input_mode: interrupt (default), kills the just-started voice
+        // turn mid-stream. Skip our auto-submit on the tag.
+        if (ev.payload?.submitted) {
+          return
+        }
+
         // CLI parity: _pending_input.put(transcript) unconditionally feeds
         // the transcript to the agent as its next turn — draft handling
         // doesn't apply because voice-mode users are speaking, not typing.
