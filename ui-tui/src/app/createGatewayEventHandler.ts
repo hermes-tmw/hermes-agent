@@ -618,6 +618,17 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        // voice.chat seam: when the server owns the submit (voice.chat: true),
+        // the transcript echo is tagged `submitted: true` and has already been
+        // routed into the session as the next agent turn server-side. The
+        // client MUST NOT forward it again — a blind re-submit lands under the
+        // busy policy and interrupts (then duplicates) the just-started voice
+        // turn. The flag, not a mirrored config read, is the sync point: any
+        // client seeing `submitted` yields regardless of its own settings.
+        if (ev.payload?.submitted) {
+          return
+        }
+
         // CLI parity: _pending_input.put(transcript) unconditionally feeds
         // the transcript to the agent as its next turn — draft handling
         // doesn't apply because voice-mode users are speaking, not typing.
