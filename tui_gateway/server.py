@@ -12451,12 +12451,11 @@ def _voice_chat_submit_transcript(text: str) -> None:
 
     client_direct interplay: the client MUST NOT also forward the same text as
     its own ``prompt.submit`` when it observes its ``voice.transcript`` echo —
-    submission ownership moves server-side with this flag. The seam therefore
-    tags the echo ``{"submitted": True}`` BEFORE dispatching (correct in both
-    interleavings of the echo/dispatch race), and the TUI client skips its own
-    auto-submit when that tag is present. If the tag were only added after
-    dispatch, a fast client could observe the untagged echo first and
-    double-send.
+    submission ownership moved server-side with this flag. The sync is
+    by-construction, not config-mirrored: ``_voice_transcript_handler`` tags
+    the echo ``submitted: True`` whenever this seam owns the submit, and the
+    client skips its own send whenever that flag is present (it never needs to
+    know the server config; a client seeing ``submitted`` always yields).
 
     Errors surface to stderr + the voice event stream rather than raising:
     the transcript itself was already emitted to the UI, so a failed submit
@@ -12521,28 +12520,26 @@ def _voice_chat_submit_transcript(text: str) -> None:
 def _voice_transcript_handler(text: str) -> None:
     """Single ``voice.transcript`` seam used by every voice loop.
 
-    Emits the event exactly as today (so /voice on, Ctrl+B record, and the
-    existing transcript-only behaviour are byte-for-byte unchanged), then —
-    when ``voice.chat: true`` — routes the same text into the session as the
-    next agent turn. With the toggle OFF **no agent turn is dispatched
-    server-side; the TUI client still auto-submits the echo on its own**
-    (``createGatewayEventHandler.ts`` ``case 'voice.transcript'``), so
-    toggling ``voice.chat`` is about *who* submits (client vs server seam),
-    not whether a turn happens.
+    When ``voice.chat`` is on, the emit is tagged ``submitted: True`` and the
+    tag is written BEFORE the dispatch runs, so the client-suppression flag is
+    correct in both interleavings of the echo/dispatch race: the client either
+    sees the echo after the seam dispatched (tag correct — server owns it) or
+    re-submits before this thread dispatches (its own submit lands under the
+    standard busy policy while the seam's ``prompt.submit`` is still queued
+    behind it — both texts are real user turns, so merging them next to each
+    other is the existing queue semantics, not corruption). In BOTH orderings
+    the echo the client acts on carries ``submitted: True``.
 
-    Toggle ON ordering: the echo carries ``submitted: true`` and is emitted
-    BEFORE dispatch so the tag is present no matter which interleaving of
-    echo-delivery vs dispatch the client observes — the client skips its own
-    auto-submit on the tag, so it can never see an untagged echo for a turn
-    the seam owns and double-send.
+    With the toggle OFF the emit is byte-for-byte today's shape (no ``submitted``
+    key at all) and this function is a pure alias of the old lambda.
     """
-    if _voice_chat_enabled():
-        _voice_emit("voice.transcript", {"text": text, "submitted": True})
-        # Pre-strip so a whitespace-only transcript tags its echo (the seam has
-        # committed to owning non-empty submissions) but still skips dispatch.
-        _voice_chat_submit_transcript(text.strip() if isinstance(text, str) else text)
-    else:
-        _voice_emit("voice.transcript", {"text": text})
+    owns_submit = _voice_chat_enabled()
+    payload: dict = {"text": text}
+    if owns_submit:
+        payload["submitted"] = True
+    _voice_emit("voice.transcript", payload)
+    if owns_submit:
+        _voice_chat_submit_transcript(text)
 
 
 # The VAD loop invokes its callback on a background audio thread; keep a named

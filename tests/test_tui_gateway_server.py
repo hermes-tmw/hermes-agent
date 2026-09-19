@@ -715,8 +715,8 @@ def test_voice_transcript_handler_toggle_on_auto_submits(monkeypatch):
         assert turn_ran.wait(timeout=5.0), "agent turn never ran"
         assert captured["sid"] == "voice-sid"
         assert captured["text"] == "what's on the calendar?"
-        # Event echo still fires BEFORE the submit (client UX unchanged) and
-        # carries the submitted tag so the TUI suppresses its own auto-submit.
+        # Event echo still fires BEFORE the submit (client UX unchanged), and
+        # carries the `submitted` tag the fixed client uses to yield.
         assert emitted[0] == (
             "voice.transcript",
             {"text": "  what's on the calendar?  ", "submitted": True},
@@ -782,13 +782,14 @@ def test_voice_chat_client_direct_no_double_send(monkeypatch):
 
     When ``voice.chat`` is on the client must NOT also forward the same text
     as its own ``prompt.submit`` — submission ownership moved server-side.
-    The assertable invariants on this side of the process boundary are the
-    ones the client relies on: (1) exactly ONE dispatch per transcript,
-    carrying the transcript text and only the transcript text; (2) the
-    ``voice.transcript`` echo is tagged ``submitted: True`` and emitted
-    BEFORE the dispatch, so a client observing either interleaving sees the
-    suppression tag (the TUI skips its auto-submit on it — see
-    ``test_voice_chat_client_echo_after_seam_dispatch_no_second_turn``).
+    The sync is by-construction: the seam emits its ``voice.transcript`` echo
+    tagged ``submitted: True`` BEFORE the dispatch runs, and the fixed TUI
+    client (createGatewayEventHandler.ts, ``case 'voice.transcript'``) skips
+    its auto-submit when the flag is present — so NO client ``prompt.submit``
+    ever leaves the client in the echo race. This test replays the real
+    sequence end-to-end: seam dispatch, then client echo handled by the fixed
+    contract (suppress on tag), and asserts exactly one turn ran, no second
+    ``prompt.submit`` reached the busy policy, and nothing queued.
     """
     monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
     monkeypatch.setenv("HERMES_VOICE", "1")
@@ -801,43 +802,102 @@ def test_voice_chat_client_direct_no_double_send(monkeypatch):
         return real_handle(req)
 
     monkeypatch.setattr(server, "handle_request", track_handle)
-    _submitted, captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch)
     emitted: list = []
-    monkeypatch.setattr(server, "_voice_emit", lambda event, payload=None: emitted.append((event, payload)))
+    monkeypatch.setattr(
+        server, "_voice_emit", lambda event, payload=None: emitted.append((event, payload))
+    )
+    _submitted, captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch)
+
+    client_submits: list = []
+
+    def tui_client_on_transcript(payload):
+        """The fixed client's `case 'voice.transcript'` contract, replayed.
+
+        Mirrors createGatewayEventHandler.ts: a truthy `submitted` flag means
+        the server already owns the turn, so the client yields; an untagged
+        echo keeps today's auto-submit behaviour.
+        """
+        if payload.get("submitted"):
+            return
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return
+        client_submits.append(text)
+        server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": "client-echo",
+                "method": "prompt.submit",
+                "params": {"session_id": "voice-sid", "text": text},
+            }
+        )
 
     try:
         server._voice_transcript_handler("one shot")
         assert turn_ran.wait(timeout=5.0)
-        assert len(dispatched) == 1, "expected exactly one prompt.submit dispatch"
+
+        # 1. The echo the client acts on is tagged BEFORE dispatch ran.
+        assert emitted[0] == ("voice.transcript", {"text": "one shot", "submitted": True})
+
+        # 2. Replay the client against its wire echo — tag suppresses the send.
+        event, payload = emitted[0]
+        assert event == "voice.transcript"
+        tui_client_on_transcript(payload)
+
+        # 3. Exactly ONE dispatch per transcript: the seam's, tagged voice-chat-*.
+        assert len(dispatched) == 1, f"expected exactly one prompt.submit dispatch, got {dispatched}"
         req = dispatched[0]
         assert req["params"] == {"session_id": "voice-sid", "text": "one shot"}
         # The seam tags its dispatch ids so a log/trace can distinguish a
         # voice-originated turn from a typed one.
         assert req["id"].startswith("voice-chat-")
-        # Echo is tagged and precedes the dispatch (race-free suppression).
-        assert emitted == [("voice.transcript", {"text": "one shot", "submitted": True})]
+
+        # 4. The echo produced no client send, no second turn, no queued prompt.
+        assert client_submits == []
+        assert "queued_prompt" not in session
+        assert captured["text"] == "one shot"  # the only turn that ran
+
+        # 5. Negative control: an untagged echo (a client on old wire, or the
+        #    toggle-off shape) still auto-submits — the flag is load-bearing,
+        #    not decoration.
+        tui_client_on_transcript({"text": "one shot"})
+        assert client_submits == ["one shot"]
     finally:
         session["running"] = False
         server._sessions.pop("voice-sid", None)
 
 
-def test_voice_chat_client_echo_after_seam_dispatch_no_second_turn(monkeypatch):
-    """P0 regression: a client echo arriving AFTER the seam dispatch must
-    not produce a second turn, a queued prompt, or an interrupt.
+def test_voice_chat_submit_when_session_busy_queues(monkeypatch):
+    """A transcript arriving mid-turn goes through the existing busy policy.
 
-    Before the fix the TUI auto-submitted EVERY ``voice.transcript`` echo
-    (``createGatewayEventHandler.ts`` ``submitRef.current(text)``). With
-    ``voice.chat`` on and the session already running the just-started voice
-    turn, that duplicate ``prompt.submit`` landed in ``_handle_busy_submit``
-    → default ``busy_input_mode: interrupt`` → ``agent.interrupt()`` on the
-    live voice turn + a queued duplicate that re-ran as the next turn. Net:
-    every utterance submitted twice, first turn killed by its own echo.
+    Rather than a bespoke voice-mode path, the seam funnels into the same
+    ``_handle_busy_submit`` queue/interrupt semantics a typed prompt sees,
+    so an in-flight agent turn handles the voice turn exactly as if Tom had
+    typed it while a reply was generating.
+    """
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
+    submitted, _captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch, running=True)
 
-    The by-construction fix: the seam tags the echo ``submitted: True``
-    before dispatch, and the client suppresses its own submit when the tag
-    is present — so this simulation dispatches the seam turn, then asserts
-    no second dispatch/queue/interrupt happens even though the (tagged) echo
-    was delivered for the client to consume.
+    try:
+        server._voice_chat_submit_transcript("follow-up from voice")
+        assert submitted["busy_submit_text"] == "follow-up from voice"
+        # Busy policy queued it for the next turn — the seam didn't run it inline.
+        assert not turn_ran.is_set()
+    finally:
+        server._sessions.pop("voice-sid", None)
+
+
+def test_voice_chat_seam_turn_never_interrupted_by_own_echo(monkeypatch):
+    """P0 lifecycle assertion: the seam's own turn is never interrupted.
+
+    The original bug killed the just-started voice turn when the client's
+    echo re-submitted under ``busy_input_mode: interrupt`` — the interrupt
+    fired on the seam's OWN inflight turn. With the fix, the tagged echo
+    suppresses the client's send, so after the seam's dispatch there is no
+    interrupt and no queued duplicate anywhere in the turn lifecycle.
+    Complements ``test_voice_chat_client_direct_no_double_send`` (which pins
+    the dispatch/echo wire shape) by asserting the end state of the session
+    the voice turn runs in.
     """
 
     class InterruptibleAgent:
@@ -852,8 +912,6 @@ def test_voice_chat_client_echo_after_seam_dispatch_no_second_turn(monkeypatch):
     monkeypatch.setenv("HERMES_VOICE", "1")
     submitted, captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch)
     session["agent"] = agent
-    emitted: list = []
-    monkeypatch.setattr(server, "_voice_emit", lambda event, payload=None: emitted.append((event, payload)))
 
     try:
         server._voice_transcript_handler("echo race")
@@ -863,10 +921,8 @@ def test_voice_chat_client_echo_after_seam_dispatch_no_second_turn(monkeypatch):
         assert captured["text"] == "echo race"
         assert session["running"] is True
 
-        # The echo the client received is tagged, so its auto-submit path
-        # suppresses — simulate the client-side contract by asserting what
-        # the client saw, then confirming no second-turn state exists.
-        assert emitted == [("voice.transcript", {"text": "echo race", "submitted": True})]
+        # No echo-triggered busy path fired: nothing queued, no interrupt,
+        # no duplicate submission anywhere in the session state.
         assert "queued_prompt" not in session
         assert agent.interrupted is False
         assert submitted == {}, "no busy-path submit fired (no duplicate turn)"
@@ -896,26 +952,6 @@ def test_voice_chat_submit_non_str_transcript_drops_loudly(monkeypatch, capsys):
         # Non-str through the full handler: emits the echo (with tag, since
         # the toggle is ON) but never dispatches.
         server._voice_transcript_handler(42)  # type: ignore[arg-type]
-        assert not turn_ran.is_set()
-    finally:
-        server._sessions.pop("voice-sid", None)
-
-
-def test_voice_chat_submit_when_session_busy_queues(monkeypatch):
-    """A transcript arriving mid-turn goes through the existing busy policy.
-
-    Rather than a bespoke voice-mode path, the seam funnels into the same
-    ``_handle_busy_submit`` queue/interrupt semantics a typed prompt sees,
-    so an in-flight agent turn handles the voice turn exactly as if Tom had
-    typed it while a reply was generating.
-    """
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"voice": {"chat": True}})
-    submitted, _captured, turn_ran, session = _voice_chat_session_fixture(monkeypatch, running=True)
-
-    try:
-        server._voice_chat_submit_transcript("follow-up from voice")
-        assert submitted["busy_submit_text"] == "follow-up from voice"
-        # Busy policy queued it for the next turn — the seam didn't run it inline.
         assert not turn_ran.is_set()
     finally:
         server._sessions.pop("voice-sid", None)
