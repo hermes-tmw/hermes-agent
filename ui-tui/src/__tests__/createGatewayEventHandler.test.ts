@@ -1570,6 +1570,64 @@ describe('createGatewayEventHandler', () => {
     })
   })
 
+  describe('voice.transcript', () => {
+    it('renders the user bubble but does not resubmit on a server-owned (tagged) echo', () => {
+      const appended: Msg[] = []
+      const ctx = buildCtx(appended)
+      const onEvent = createGatewayEventHandler(ctx)
+      vi.useFakeTimers()
+
+      try {
+        onEvent({ payload: { submitted: true, text: '  turn on the porch light  ' }, type: 'voice.transcript' } as any)
+
+        // Submit is suppressed…
+        expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+        // …and no deferred timer tries to submit later either.
+        vi.runAllTimers()
+        expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+        // Composer untouched (clearing is strictly the untagged path's concern).
+        expect(ctx.composer.setInput).not.toHaveBeenCalled()
+        // …but the utterance still renders live, trimmed, as the user bubble.
+        expect(appended).toEqual([{ role: 'user', text: 'turn on the porch light' }])
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('submits an untagged echo through the deferred submit path (toggle-off parity)', () => {
+      const appended: Msg[] = []
+      const ctx = buildCtx(appended)
+      const onEvent = createGatewayEventHandler(ctx)
+      vi.useFakeTimers()
+
+      try {
+        onEvent({ payload: { text: 'hello agent' }, type: 'voice.transcript' } as any)
+
+        expect(ctx.composer.setInput).toHaveBeenCalledWith('')
+        expect(ctx.submission.submitRef.current).not.toHaveBeenCalled() // deferred
+        vi.runAllTimers()
+        expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('hello agent')
+        // Bubble comes from inside submitRef (startSubmit), not this handler.
+        expect(appended).toEqual([])
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('ignores tagged echoes with empty or whitespace-only text', () => {
+      const appended: Msg[] = []
+      const ctx = buildCtx(appended)
+      const onEvent = createGatewayEventHandler(ctx)
+
+      onEvent({ payload: { submitted: true, text: '   ' }, type: 'voice.transcript' } as any)
+      onEvent({ payload: { submitted: true, text: '' }, type: 'voice.transcript' } as any)
+      onEvent({ payload: { submitted: true }, type: 'voice.transcript' } as any)
+
+      expect(appended).toEqual([])
+      expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+    })
+  })
+
   describe('billing.step_up.verification', () => {
     beforeEach(() => {
       openExternalUrlMock.mockClear()
